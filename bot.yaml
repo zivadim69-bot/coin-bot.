@@ -1,0 +1,29 @@
+name: Coin Dashboard Bot
+
+on:
+  schedule:
+    # каждый час в 0 минут (время UTC)
+    - cron: "0 * * * *"
+  workflow_dispatch: {}  # позволяет запускать вручную кнопкой на GitHub
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SYMBOL: BTCUSDT
+        run: python coin_dashboard_bot.py
