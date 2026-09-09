@@ -39,6 +39,7 @@ TOKEN_SYMBOL = os.environ.get("TOKEN_SYMBOL", "TOKEN")
 DERIV_SYMBOL = os.environ.get("DERIV_SYMBOL", "")
 DERIV_EXCHANGE = os.environ.get("DERIV_EXCHANGE", "")
 COIN_ID = os.environ.get("COIN_ID", "")
+BLOCKSCOUT_BASE = os.environ.get("BLOCKSCOUT_BASE", "").rstrip("/")
 
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 GOPLUS_BASE = "https://api.gopluslabs.io/api/v1"
@@ -47,7 +48,44 @@ DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex"
 NO_DATA = "нет данных"
 
 
-def get_token_security(chain_id, address):
+def get_token_security_blockscout(base_url, address):
+    """
+    Резервный источник держателей/концентрации через Blockscout-эксплорер сети
+    (например robinhoodchain.blockscout.com) - для сетей, которых нет в GoPlus.
+    Не даёт минт/локап ликвидности (этого Blockscout не знает), только держателей.
+    """
+    if not base_url:
+        return None
+    try:
+        info_url = f"{base_url}/api/v2/tokens/{address}"
+        r = requests.get(info_url, timeout=15)
+        r.raise_for_status()
+        info = r.json()
+        total_supply = float(info.get("total_supply") or 0)
+        holder_count = info.get("holders") or info.get("holders_count") or "?"
+
+        holders_url = f"{base_url}/api/v2/tokens/{address}/holders"
+        r2 = requests.get(holders_url, timeout=15)
+        r2.raise_for_status()
+        items = r2.json().get("items", [])[:10]
+        top10_supply = sum(float(item.get("value") or 0) for item in items)
+
+        top10_pct = (top10_supply / total_supply * 100) if total_supply else 0
+
+        return {
+            "holder_count": holder_count,
+            "top10_pct": top10_pct,
+            "is_mintable": None,   # Blockscout этого не знает
+            "is_open_source": None,
+            "lp_locked_pct": 0,
+            "has_lp_data": False,
+            "source": "blockscout",
+        }
+    except Exception:
+        return None
+
+
+def get_token_security(chain_id, address, blockscout_base=""):
     """Риск-данные по контракту. Возвращает None, если источник недоступен/не поддерживает сеть."""
     try:
         url = f"{GOPLUS_BASE}/token_security/{chain_id}"
@@ -57,7 +95,7 @@ def get_token_security(chain_id, address):
         result = r.json().get("result", {})
         data = result.get(address.lower()) or next(iter(result.values()), None)
         if not data:
-            return None
+            return get_token_security_blockscout(blockscout_base, address)
 
         holders = data.get("holders", []) or []
         top10_pct = sum(float(h.get("percent", 0)) for h in holders[:10]) * 100
@@ -76,9 +114,10 @@ def get_token_security(chain_id, address):
             "is_open_source": str(data.get("is_open_source", "0")) == "1",
             "lp_locked_pct": lp_locked_pct,
             "has_lp_data": bool(lp_holders),
+            "source": "goplus",
         }
     except Exception:
-        return None
+        return get_token_security_blockscout(blockscout_base, address)
 
 
 def get_dex_market_data(address):
@@ -105,38 +144,35 @@ def get_dex_market_data(address):
         return None
 
 
-def get_derivative_ticker(symbol, exchange_hint):
-    """Опционально: фандинг/OI, если монета торгуется фьючерсом на CEX."""
+def get_all_derivative_tickers(symbol):
+    """Фандинг/OI по ВСЕМ биржам сразу, где торгуется этот тикер (не только одна)."""
     if not symbol:
-        return None
+        return []
     try:
         url = f"{COINGECKO_BASE}/derivatives"
         r = requests.get(url, timeout=15)
         r.raise_for_status()
         data = r.json()
         symbol_upper = symbol.upper()
-        exchange_lower = exchange_hint.lower()
-        match = None
+
+        matches = []
+        seen_markets = set()
         for row in data:
             if row.get("symbol", "").upper() != symbol_upper:
                 continue
-            if exchange_lower and exchange_lower in row.get("market", "").lower():
-                match = row
-                break
-        if match is None:
-            for row in data:
-                if row.get("symbol", "").upper() == symbol_upper:
-                    match = row
-                    break
-        if match is None:
-            return None
-        return {
-            "market": match.get("market"),
-            "funding_rate": float(match.get("funding_rate") or 0),
-            "open_interest_usd": float(match.get("open_interest") or 0),
-        }
+            market = row.get("market", "?")
+            if market in seen_markets:
+                continue
+            seen_markets.add(market)
+            matches.append({
+                "market": market,
+                "price": float(row.get("price") or 0),
+                "funding_rate": float(row.get("funding_rate") or 0),
+                "open_interest_usd": float(row.get("open_interest") or 0),
+            })
+        return matches
     except Exception:
-        return None
+        return []
 
 
 def get_dex_magnets(chain, pair_address, current_price):
@@ -197,23 +233,39 @@ def get_magnets(coin_id, current_price):
 
 
 def compute_contract_verdict(security):
-    """Простое прозрачное правило риска контракта (без ИИ). Требует данные GoPlus."""
+    """Простое прозрачное правило риска контракта (без ИИ)."""
     flags = []
+    unknowns = []
+
     if security["top10_pct"] >= 50:
         flags.append(f"у топ-10 кошельков {security['top10_pct']:.0f}% монет")
-    if security["is_mintable"]:
+
+    if security["is_mintable"] is True:
         flags.append("можно допечатать монеты")
+    elif security["is_mintable"] is None:
+        unknowns.append("не проверен минт")
+
     if security["has_lp_data"] and security["lp_locked_pct"] < 50:
         flags.append("ликвидность не заблокирована")
-    if not security["is_open_source"]:
+    elif not security["has_lp_data"]:
+        unknowns.append("не проверен локап ликвидности")
+
+    if security["is_open_source"] is False:
         flags.append("код контракта не открыт")
 
     if flags:
-        return "контракт опасен: " + "; ".join(flags), "не покупать, риск обвала/рага"
-    return "явных красных флагов не найдено по базовым метрикам", "можно рассматривать, но проверяй остальное вручную"
+        meaning = "контракт опасен: " + "; ".join(flags)
+        action = "не покупать, риск обвала/рага"
+    elif unknowns:
+        meaning = "по проверенным метрикам красных флагов нет, но " + ", ".join(unknowns)
+        action = "проверь недостающее вручную перед покупкой - вывод неполный"
+    else:
+        meaning = "явных красных флагов не найдено по базовым метрикам"
+        action = "можно рассматривать, но проверяй остальное вручную"
+    return meaning, action
 
 
-def format_message(security, dex, ticker, magnets):
+def format_message(security, dex, tickers, magnets):
     lines = [f"🪙 ${TOKEN_SYMBOL}"]
 
     if dex:
@@ -225,27 +277,31 @@ def format_message(security, dex, ticker, magnets):
     else:
         lines.append(f"🔴 Цена/объём (DexScreener): {NO_DATA}")
 
-    if ticker:
-        lines.append(
-            f"🪁 Фандинг ({ticker['market']}): {ticker['funding_rate']:+.4f}% "
-            f"· OI {ticker['open_interest_usd']/1_000_000:.1f} млн $"
-        )
+    if tickers:
+        total_oi = sum(t["open_interest_usd"] for t in tickers)
+        funding_parts = [f"{t['market']} {t['funding_rate']:+.4f}%" for t in tickers]
+        lines.append(f"🪁 Фандинг по биржам: {' · '.join(funding_parts)}")
+        lines.append(f"📈 Суммарный OI по биржам: {total_oi/1_000_000:.1f} млн $")
     else:
-        lines.append(f"🪁 Фандинг/OI на биржах: {NO_DATA} (нет фьючерса)")
+        lines.append(f"🪁 Фандинг/OI на биржах: {NO_DATA} (нет фьючерса ни на одной бирже)")
 
     if security:
+        source_note = " (via Blockscout)" if security.get("source") == "blockscout" else ""
         lines.append(
-            f"🛡 Держателей: {security['holder_count']} · у топ-10 кошельков {security['top10_pct']:.0f}% монет"
+            f"🛡 Держателей: {security['holder_count']} · у топ-10 кошельков {security['top10_pct']:.0f}% монет{source_note}"
         )
-        mint_txt = "можно допечатать монеты ⚠️" if security["is_mintable"] else "нельзя допечатать"
-        lines.append(f"🖨 Минт: {mint_txt}")
+        if security["is_mintable"] is None:
+            lines.append(f"🖨 Минт: {NO_DATA} (источник не предоставляет эту информацию)")
+        else:
+            mint_txt = "можно допечатать монеты ⚠️" if security["is_mintable"] else "нельзя допечатать"
+            lines.append(f"🖨 Минт: {mint_txt}")
         if security["has_lp_data"]:
             lock_word = "заблокирована" if security["lp_locked_pct"] >= 50 else "НЕ заблокирована ⚠️"
             lines.append(f"🔒 Ликвидность: {lock_word} ({security['lp_locked_pct']:.0f}%)")
         else:
             lines.append(f"🔒 Ликвидность (локап): {NO_DATA}")
     else:
-        lines.append(f"🛡 Держатели/минт/локап (GoPlus): {NO_DATA} - сеть не поддерживается или адрес не найден")
+        lines.append(f"🛡 Держатели/минт/локап: {NO_DATA} - ни один источник не поддерживает эту сеть")
 
     lines.append(f"🧲 Ближайшие уровни: {magnets if magnets else NO_DATA}")
 
@@ -273,9 +329,9 @@ def main():
     if not TOKEN_ADDRESS:
         raise SystemExit("Задай переменную окружения TOKEN_ADDRESS (адрес контракта токена)")
 
-    security = get_token_security(CHAIN_ID, TOKEN_ADDRESS)
+    security = get_token_security(CHAIN_ID, TOKEN_ADDRESS, BLOCKSCOUT_BASE)
     dex = get_dex_market_data(TOKEN_ADDRESS)
-    ticker = get_derivative_ticker(DERIV_SYMBOL, DERIV_EXCHANGE)
+    tickers = get_all_derivative_tickers(DERIV_SYMBOL)
     price_for_magnets = dex["price"] if dex else None
     magnets = None
     if dex and dex.get("pair_address"):
@@ -283,7 +339,7 @@ def main():
     if not magnets:
         magnets = get_magnets(COIN_ID, price_for_magnets)
 
-    message = format_message(security, dex, ticker, magnets)
+    message = format_message(security, dex, tickers, magnets)
     send_telegram_message(message)
     print("Отправлено:\n", message)
 
