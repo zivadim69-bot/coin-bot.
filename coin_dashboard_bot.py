@@ -64,9 +64,9 @@ def get_derivative_ticker(symbol, exchange_hint):
         "market": match.get("market"),
         "price": float(match.get("price") or 0),
         "change_pct": float(match.get("price_percentage_change_24h") or 0),
-        "volume_24h": float(match.get("volume_24h") or match.get("h24_volume") or 0),
+        "volume_24h": float(match.get("volume_24h") or 0),
         "funding_rate": float(match.get("funding_rate") or 0),
-        "open_interest_usd": float(match.get("open_interest_usd") or 0),
+        "open_interest_usd": float(match.get("open_interest") or 0),
     }
 
 
@@ -94,17 +94,17 @@ def compute_magnets(klines, current_price):
     result = []
     if below:
         lvl = below[-1]
-        result.append(f"снизу {lvl:.4f} ({pct(lvl):+.1f}%)")
+        result.append(f"снизу {lvl:.4f} ({pct(lvl):+.2f}%)")
     if above:
         lvl = above[0]
-        result.append(f"сверху {lvl:.4f} ({pct(lvl):+.1f}%)")
+        result.append(f"сверху {lvl:.4f} ({pct(lvl):+.2f}%)")
     return " · ".join(result) if result else "нет данных"
 
 
 def format_message(symbol, ticker, magnets):
     lines = [
         f"🔴 {symbol} ({ticker['market']}) — цена {ticker['price']:.4f} "
-        f"· за сутки {ticker['change_pct']:+.1f}% "
+        f"· за сутки {ticker['change_pct']:+.2f}% "
         f"· оборот {ticker['volume_24h']/1_000_000:.1f} млн $",
         f"📈 Открытый интерес: {ticker['open_interest_usd']/1_000_000:.1f} млн $",
         f"🪁 Фандинг: {ticker['funding_rate']:+.4f}%",
