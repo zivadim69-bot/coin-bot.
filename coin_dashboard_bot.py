@@ -1,13 +1,19 @@
 """
-Бесплатный бот-дашборд по монете (в стиле $PONS) на базе публичного API Bybit.
-Не требует AI, не требует платных сервисов — только 2 бесплатных вещи:
-  1. Telegram Bot Token (BotFather)
-  2. Публичный API Bybit (без ключа, без регистрации)
+Бесплатный бот-дашборд по монете (в стиле $PONS) на базе публичного API CoinGecko.
+Не требует AI, не требует платных сервисов и работает из облака (GitHub Actions),
+в отличие от прямых API бирж (Bybit/Binance блокируют IP облачных серверов).
+
+Источники данных:
+  1. Telegram Bot Token (BotFather) - бесплатно
+  2. CoinGecko Public API (без ключа) - агрегирует данные бирж, доступен из облака
 
 Настройка через переменные окружения (см. инструкцию в чате):
-  TELEGRAM_TOKEN  - токен бота от BotFather
+  TELEGRAM_TOKEN   - токен бота от BotFather
   TELEGRAM_CHAT_ID - твой chat_id
-  SYMBOL          - тикер, например BTCUSDT, ETHUSDT, PONSUSDT
+  DERIV_SYMBOL     - тикер фьючерса, например BTCUSDT, ETHUSDT
+  DERIV_EXCHANGE   - название биржи для фильтра, например Bybit, Binance (Futures)
+  COIN_ID          - id монеты в CoinGecko для расчёта уровней, например bitcoin, ethereum
+                      (полный список: https://api.coingecko.com/api/v3/coins/list)
 """
 
 import os
@@ -15,54 +21,63 @@ import requests
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-SYMBOL = os.environ.get("SYMBOL", "BTCUSDT")
+DERIV_SYMBOL = os.environ.get("DERIV_SYMBOL", "BTCUSDT")
+DERIV_EXCHANGE = os.environ.get("DERIV_EXCHANGE", "Bybit")
+COIN_ID = os.environ.get("COIN_ID", "bitcoin")
 
-BYBIT_BASE = "https://api.bybit.com"
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 
-def get_ticker(symbol):
-    """Цена, объём за 24ч, изменение %, funding rate, открытый интерес."""
-    url = f"{BYBIT_BASE}/v5/market/tickers"
-    params = {"category": "linear", "symbol": symbol}
-    r = requests.get(url, params=params, timeout=10)
+def get_derivative_ticker(symbol, exchange_hint):
+    """
+    Цена, объём, funding rate и открытый интерес по фьючерсу на конкретной бирже.
+    Использует агрегированный публичный эндпоинт CoinGecko (не блокируется облачными IP).
+    """
+    url = f"{COINGECKO_BASE}/derivatives"
+    r = requests.get(url, timeout=15)
     r.raise_for_status()
-    data = r.json()["result"]["list"][0]
+    data = r.json()
+
+    symbol_upper = symbol.upper()
+    exchange_lower = exchange_hint.lower()
+
+    match = None
+    for row in data:
+        if row.get("symbol", "").upper() != symbol_upper:
+            continue
+        market_name = row.get("market", "").lower()
+        if exchange_lower in market_name:
+            match = row
+            break
+
+    if match is None:
+        # если конкретная биржа не нашлась - берём первое совпадение по символу
+        for row in data:
+            if row.get("symbol", "").upper() == symbol_upper:
+                match = row
+                break
+
+    if match is None:
+        raise ValueError(f"Не найден тикер {symbol} ни на одной бирже в CoinGecko")
+
     return {
-        "price": float(data["lastPrice"]),
-        "change_pct": float(data["price24hPcnt"]) * 100,
-        "turnover_24h": float(data["turnover24h"]),
-        "funding_rate": float(data["fundingRate"]) * 100,
-        "open_interest": float(data["openInterest"]),
-        "open_interest_value": float(data["openInterestValue"]),
+        "market": match.get("market"),
+        "price": float(match.get("price") or 0),
+        "change_pct": float(match.get("price_percentage_change_24h") or 0),
+        "volume_24h": float(match.get("volume_24h") or match.get("h24_volume") or 0),
+        "funding_rate": float(match.get("funding_rate") or 0),
+        "open_interest_usd": float(match.get("open_interest_usd") or 0),
     }
 
 
-def get_long_short_ratio(symbol):
-    """Публичное соотношение топ-трейдеров лонг/шорт (аналог "лидеров")."""
-    url = f"{BYBIT_BASE}/v5/market/account-ratio"
-    params = {"category": "linear", "symbol": symbol, "period": "1h", "limit": 1}
-    r = requests.get(url, params=params, timeout=10)
+def get_ohlc(coin_id, days=7):
+    """Дневные свечи (high/low) через CoinGecko для расчёта уровней-магнитов."""
+    url = f"{COINGECKO_BASE}/coins/{coin_id}/ohlc"
+    params = {"vs_currency": "usd", "days": days}
+    r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
-    lst = r.json()["result"]["list"]
-    if not lst:
-        return None
-    row = lst[0]
-    return {
-        "buy_ratio": float(row["buyRatio"]) * 100,
-        "sell_ratio": float(row["sellRatio"]) * 100,
-    }
-
-
-def get_klines(symbol, interval="D", limit=5):
-    """Дневные свечи для расчёта локальных уровней (магнитов)."""
-    url = f"{BYBIT_BASE}/v5/market/kline"
-    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    rows = r.json()["result"]["list"]  # [start, open, high, low, close, volume, turnover]
-    return [
-        {"high": float(row[2]), "low": float(row[3])} for row in rows
-    ]
+    rows = r.json()  # [ [timestamp, open, high, low, close], ... ]
+    return [{"high": row[2], "low": row[3]} for row in rows]
 
 
 def compute_magnets(klines, current_price):
@@ -86,18 +101,15 @@ def compute_magnets(klines, current_price):
     return " · ".join(result) if result else "нет данных"
 
 
-def format_message(symbol, ticker, ls_ratio, magnets):
+def format_message(symbol, ticker, magnets):
     lines = [
-        f"🔴 {symbol} — цена {ticker['price']:.4f} · за сутки {ticker['change_pct']:+.1f}% "
-        f"· оборот {ticker['turnover_24h']/1_000_000:.1f} млн $",
-        f"📈 Открытый интерес: {ticker['open_interest_value']/1_000_000:.1f} млн $",
+        f"🔴 {symbol} ({ticker['market']}) — цена {ticker['price']:.4f} "
+        f"· за сутки {ticker['change_pct']:+.1f}% "
+        f"· оборот {ticker['volume_24h']/1_000_000:.1f} млн $",
+        f"📈 Открытый интерес: {ticker['open_interest_usd']/1_000_000:.1f} млн $",
         f"🪁 Фандинг: {ticker['funding_rate']:+.4f}%",
+        f"🧲 Ближайшие уровни: {magnets}",
     ]
-    if ls_ratio:
-        lines.append(
-            f"👥 Топ-трейдеры: лонг {ls_ratio['buy_ratio']:.0f}% · шорт {ls_ratio['sell_ratio']:.0f}%"
-        )
-    lines.append(f"🧲 Ближайшие уровни: {magnets}")
     return "\n".join(lines)
 
 
@@ -112,12 +124,11 @@ def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise SystemExit("Задай переменные окружения TELEGRAM_TOKEN и TELEGRAM_CHAT_ID")
 
-    ticker = get_ticker(SYMBOL)
-    ls_ratio = get_long_short_ratio(SYMBOL)
-    klines = get_klines(SYMBOL)
-    magnets = compute_magnets(klines, ticker["price"])
+    ticker = get_derivative_ticker(DERIV_SYMBOL, DERIV_EXCHANGE)
+    ohlc = get_ohlc(COIN_ID)
+    magnets = compute_magnets(ohlc, ticker["price"])
 
-    message = format_message(SYMBOL, ticker, ls_ratio, magnets)
+    message = format_message(DERIV_SYMBOL, ticker, magnets)
     send_telegram_message(message)
     print("Отправлено:\n", message)
 
