@@ -139,44 +139,99 @@ def get_updates():
     return updates
 
 
+def _normalize_search_text(value):
+    """Нормализует тикер/название для точного сравнения."""
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def _looks_like_contract(query):
+    """Распознаёт EVM и Solana адреса без привязки только к 0x."""
+    q = query.strip()
+    if q.lower().startswith("0x") and len(q) >= 40:
+        return True
+    # Solana base58-адрес обычно 32-44 символа и не содержит 0/O/I/l.
+    if 32 <= len(q) <= 44 and all(ch.isalnum() for ch in q):
+        return not any(ch in q for ch in "0OIl")
+    return False
+
+
 def search_token(query):
-    """Ищет токен по названию/тикеру через DexScreener. Возвращает список кандидатов."""
+    """
+    Ищет именно запрошенный токен через DexScreener.
+
+    Важно: тикер сам по себе не уникален. Поэтому сначала собираем данные по
+    каждому contract/mint, затем отбрасываем результаты, которые не являются
+    точным совпадением по symbol/name. Ликвидность используется только для
+    выбора лучшей пары ОДНОГО и того же токена, а не для определения его
+    "подлинности".
+    """
+    q = _normalize_search_text(query)
     r = requests.get(DEXSCREENER_SEARCH, params={"q": query}, timeout=15)
     r.raise_for_status()
     pairs = r.json().get("pairs") or []
     if not pairs:
         return []
 
-    # группируем по адресу токена (base token) - один токен может иметь много пар
-    by_address = {}
+    # Ключ = chain + contract/mint. Один контракт может иметь много DEX-пар.
+    by_token = {}
     for p in pairs:
-        base = p.get("baseToken", {})
+        base = p.get("baseToken") or {}
         addr = base.get("address")
+        chain = str(p.get("chainId") or "?")
         if not addr:
             continue
+
         liq = float((p.get("liquidity") or {}).get("usd", 0) or 0)
-        if addr not in by_address or liq > by_address[addr]["liquidity"]:
-            by_address[addr] = {
-                "address": addr,
-                "symbol": base.get("symbol", "?"),
-                "name": base.get("name", "?"),
-                "chain": p.get("chainId", "?"),
-                "price": float(p.get("priceUsd") or 0),
-                "liquidity": liq,
-                "pair_address": p.get("pairAddress", ""),
-            }
-    # сортируем по ликвидности - самый ликвидный вероятнее всего "настоящий"
-    return sorted(by_address.values(), key=lambda x: x["liquidity"], reverse=True)
+        volume = float((p.get("volume") or {}).get("h24", 0) or 0)
+        key = (chain.casefold(), str(addr).casefold())
+
+        candidate = {
+            "address": addr,
+            "symbol": base.get("symbol", "?"),
+            "name": base.get("name", "?"),
+            "chain": chain,
+            "price": float(p.get("priceUsd") or 0),
+            "liquidity": liq,
+            "volume_24h": volume,
+            "pair_address": p.get("pairAddress", ""),
+        }
+
+        # Для одного токена выбираем только его наиболее ликвидную пару.
+        if key not in by_token or liq > by_token[key]["liquidity"]:
+            by_token[key] = candidate
+
+    candidates = list(by_token.values())
+    if not candidates:
+        return []
+
+    # Сначала точное совпадение тикера. Если его нет — точное имя.
+    exact_symbol = [c for c in candidates if _normalize_search_text(c["symbol"]) == q]
+    exact_name = [c for c in candidates if _normalize_search_text(c["name"]) == q]
+
+    if exact_symbol:
+        candidates = exact_symbol
+    elif exact_name:
+        candidates = exact_name
+    else:
+        # Не выдаём случайные частичные совпадения вроде XYZINU при запросе XYZ.
+        return []
+
+    # Внутри уже совпадающих токенов сортируем по ликвидности, затем по объёму.
+    return sorted(
+        candidates,
+        key=lambda x: (x["liquidity"], x["volume_24h"]),
+        reverse=True,
+    )
 
 
 def format_candidates_list(query, candidates):
-    lines = [f"Нашёл несколько токенов по запросу '{query}':\n"]
+    lines = [f"Нашёл несколько точных совпадений по запросу '{query}':\n"]
     for i, c in enumerate(candidates[:6], 1):
         lines.append(
-            f"{i}. {c['symbol']} ({c['chain']}) - цена {c['price']:.6f}, "
+            f"{i}. {c['symbol']} ({c['name']}, {c['chain']}) - цена {c['price']:.6f}, "
             f"ликвидность {c['liquidity']/1_000_000:.2f} млн $\n   {c['address']}"
         )
-    lines.append("\nУточни адресом: /coin 0xАдрес")
+    lines.append("\nТочный адрес: /coin <адрес>")
     return "\n".join(lines)
 
 
@@ -299,8 +354,8 @@ def handle_command(text):
     if not candidates:
         return f"Ничего не нашёл по запросу '{query}'. Проверь тикер или используй точный адрес контракта."
 
-    # если запрос сам похож на адрес (0x... или длинная строка) - ищем точное совпадение
-    if query.lower().startswith("0x") and len(query) > 20:
+    # если запрос похож на адрес EVM или Solana - ищем только точное совпадение
+    if _looks_like_contract(query):
         exact = [c for c in candidates if c["address"].lower() == query.lower()]
         if exact:
             return format_quick_report(exact[0])
