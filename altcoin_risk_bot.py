@@ -232,6 +232,56 @@ def get_magnets(coin_id, current_price):
         return None
 
 
+def get_top_trader_ratio(symbol):
+    """
+    Соотношение лонг/шорт топ-трейдеров - напрямую с Binance/Bybit (в CoinGecko такого нет).
+    Может не сработать из облака (GitHub Actions) из-за блокировки IP биржами - в этом
+    случае просто возвращает None, и в сообщении будет честное "нет данных".
+    """
+    if not symbol:
+        return None
+
+    # Пробуем Binance
+    try:
+        url = "https://fapi.binance.com/futures/data/topLongShortAccountRatio"
+        params = {"symbol": symbol, "period": "1h", "limit": 1}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if data:
+            row = data[-1]
+            return {
+                "source": "Binance",
+                "long_pct": float(row["longAccount"]) * 100,
+                "short_pct": float(row["shortAccount"]) * 100,
+                "ratio": float(row["longShortRatio"]),
+            }
+    except Exception:
+        pass
+
+    # Если Binance не ответил - пробуем Bybit
+    try:
+        url = "https://api.bybit.com/v5/market/account-ratio"
+        params = {"category": "linear", "symbol": symbol, "period": "1h", "limit": 1}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        lst = r.json().get("result", {}).get("list", [])
+        if lst:
+            row = lst[0]
+            buy_pct = float(row["buyRatio"]) * 100
+            sell_pct = float(row["sellRatio"]) * 100
+            return {
+                "source": "Bybit",
+                "long_pct": buy_pct,
+                "short_pct": sell_pct,
+                "ratio": (buy_pct / sell_pct) if sell_pct else 0,
+            }
+    except Exception:
+        pass
+
+    return None
+
+
 def compute_contract_verdict(security):
     """Простое прозрачное правило риска контракта (без ИИ)."""
     flags = []
@@ -265,7 +315,7 @@ def compute_contract_verdict(security):
     return meaning, action
 
 
-def format_message(security, dex, tickers, magnets):
+def format_message(security, dex, tickers, magnets, top_trader):
     lines = [f"🪙 ${TOKEN_SYMBOL}"]
 
     if dex:
@@ -284,6 +334,14 @@ def format_message(security, dex, tickers, magnets):
         lines.append(f"📈 Суммарный OI по биржам: {total_oi/1_000_000:.1f} млн $")
     else:
         lines.append(f"🪁 Фандинг/OI на биржах: {NO_DATA} (нет фьючерса ни на одной бирже)")
+
+    if top_trader:
+        lines.append(
+            f"👥 Топ-трейдеры ({top_trader['source']}): лонг {top_trader['long_pct']:.0f}% "
+            f"· шорт {top_trader['short_pct']:.0f}%"
+        )
+    else:
+        lines.append(f"👥 Топ-трейдеры лонг/шорт: {NO_DATA} (биржа заблокировала облачный IP)")
 
     if security:
         source_note = " (via Blockscout)" if security.get("source") == "blockscout" else ""
@@ -332,6 +390,7 @@ def main():
     security = get_token_security(CHAIN_ID, TOKEN_ADDRESS, BLOCKSCOUT_BASE)
     dex = get_dex_market_data(TOKEN_ADDRESS)
     tickers = get_all_derivative_tickers(DERIV_SYMBOL)
+    top_trader = get_top_trader_ratio(DERIV_SYMBOL)
     price_for_magnets = dex["price"] if dex else None
     magnets = None
     if dex and dex.get("pair_address"):
@@ -339,7 +398,7 @@ def main():
     if not magnets:
         magnets = get_magnets(COIN_ID, price_for_magnets)
 
-    message = format_message(security, dex, tickers, magnets)
+    message = format_message(security, dex, tickers, magnets, top_trader)
     send_telegram_message(message)
     print("Отправлено:\n", message)
 

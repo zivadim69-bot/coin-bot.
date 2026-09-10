@@ -14,6 +14,11 @@
   DERIV_EXCHANGE   - название биржи для фильтра, например Bybit, Binance (Futures)
   COIN_ID          - id монеты в CoinGecko для расчёта уровней, например bitcoin, ethereum
                       (полный список: https://api.coingecko.com/api/v3/coins/list)
+
+ВАЖНО: блок "Лидеры"/"Толпы" (позиции конкретных крупных счетов) в этой версии
+НЕ реализован - это отдельные данные с конкретных бирж/платформ (например Hyperliquid),
+требующие отслеживания конкретных кошельков. Текущая версия закрывает: цену, объём,
+фандинг, открытый интерес, несколько уровней-магнитов с датами и простой авто-вывод.
 """
 
 import os
@@ -29,10 +34,7 @@ COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 
 def get_derivative_ticker(symbol, exchange_hint):
-    """
-    Цена, объём, funding rate и открытый интерес по фьючерсу на конкретной бирже.
-    Использует агрегированный публичный эндпоинт CoinGecko (не блокируется облачными IP).
-    """
+    """Цена, объём, funding rate и открытый интерес по фьючерсу на конкретной бирже."""
     url = f"{COINGECKO_BASE}/derivatives"
     r = requests.get(url, timeout=15)
     r.raise_for_status()
@@ -45,13 +47,11 @@ def get_derivative_ticker(symbol, exchange_hint):
     for row in data:
         if row.get("symbol", "").upper() != symbol_upper:
             continue
-        market_name = row.get("market", "").lower()
-        if exchange_lower in market_name:
+        if exchange_lower in row.get("market", "").lower():
             match = row
             break
 
     if match is None:
-        # если конкретная биржа не нашлась - берём первое совпадение по символу
         for row in data:
             if row.get("symbol", "").upper() == symbol_upper:
                 match = row
@@ -70,45 +70,121 @@ def get_derivative_ticker(symbol, exchange_hint):
     }
 
 
-def get_ohlc(coin_id, days=7):
-    """Дневные свечи (high/low) через CoinGecko для расчёта уровней-магнитов."""
+def get_multi_timeframe_extremes(coin_id):
+    """
+    Диапазоны high/low за 4 часа, 1 день, 1 неделю и 1 месяц.
+    CoinGecko отдаёt 30-минутные свечи при days=1, 4-часовые при days=7/30 -
+    берём последние 8 получасовых свечей за 4ч, весь пул за 1д/1нед/1мес.
+    """
+    result = {}
+
     url = f"{COINGECKO_BASE}/coins/{coin_id}/ohlc"
-    params = {"vs_currency": "usd", "days": days}
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    rows = r.json()  # [ [timestamp, open, high, low, close], ... ]
-    return [{"high": row[2], "low": row[3]} for row in rows]
+
+    r1 = requests.get(url, params={"vs_currency": "usd", "days": 1}, timeout=15)
+    r1.raise_for_status()
+    rows1 = r1.json()  # 30-минутные свечи за последние 24ч
+    if rows1:
+        last_4h_rows = rows1[-8:]  # 8 * 30 мин = 4 часа
+        result["4ч"] = {
+            "high": max(row[2] for row in last_4h_rows),
+            "low": min(row[3] for row in last_4h_rows),
+        }
+        result["1д"] = {
+            "high": max(row[2] for row in rows1),
+            "low": min(row[3] for row in rows1),
+        }
+
+    r7 = requests.get(url, params={"vs_currency": "usd", "days": 7}, timeout=15)
+    r7.raise_for_status()
+    rows7 = r7.json()
+    if rows7:
+        result["1нед"] = {
+            "high": max(row[2] for row in rows7),
+            "low": min(row[3] for row in rows7),
+        }
+
+    r30 = requests.get(url, params={"vs_currency": "usd", "days": 30}, timeout=15)
+    r30.raise_for_status()
+    rows30 = r30.json()
+    if rows30:
+        result["1мес"] = {
+            "high": max(row[2] for row in rows30),
+            "low": min(row[3] for row in rows30),
+        }
+
+    return result
 
 
-def compute_magnets(klines, current_price):
-    """Простейшие уровни-магниты: ближайшие максимумы/минимумы за последние дни."""
-    highs = sorted({k["high"] for k in klines}, reverse=True)
-    lows = sorted({k["low"] for k in klines})
-
-    above = [h for h in highs if h > current_price]
-    below = [l for l in lows if l < current_price]
+def compute_magnets(timeframe_extremes, current_price):
+    """Ближайшие уровни по каждому периоду отдельно: 4ч / 1д / 1нед / 1мес."""
 
     def pct(level):
         return (level - current_price) / current_price * 100
 
-    result = []
-    if below:
-        lvl = below[-1]
-        result.append(f"снизу {lvl:.4f} ({pct(lvl):+.2f}%)")
-    if above:
-        lvl = above[0]
-        result.append(f"сверху {lvl:.4f} ({pct(lvl):+.2f}%)")
-    return " · ".join(result) if result else "нет данных"
+    above_parts = []
+    below_parts = []
+    for label, ext in timeframe_extremes.items():
+        high, low = ext["high"], ext["low"]
+        if high > current_price:
+            above_parts.append((high, f"{high:.4f} ({pct(high):+.2f}%, {label})"))
+        if low < current_price:
+            below_parts.append((low, f"{low:.4f} ({pct(low):+.2f}%, {label})"))
+
+    above_parts.sort(key=lambda x: x[0])
+    below_parts.sort(key=lambda x: x[0], reverse=True)
+
+    parts = []
+    if below_parts:
+        parts.append("снизу " + ", затем ".join(p[1] for p in below_parts))
+    if above_parts:
+        parts.append("сверху " + ", затем ".join(p[1] for p in above_parts))
+
+    return " · ".join(parts) if parts else "нет данных"
 
 
-def format_message(symbol, ticker, magnets):
+def compute_verdict(ticker, timeframe_extremes, current_price):
+    """
+    Простой прозрачный вывод (без ИИ, чистые правила):
+    смотрим на знак фандинга и на то, ближе цена к поддержке или к сопротивлению
+    (используем самый короткий доступный период - 4ч, если есть, иначе 1д).
+    """
+    ext = timeframe_extremes.get("4ч") or timeframe_extremes.get("1д")
+    if not ext:
+        return "недостаточно данных по уровням", "дождаться данных для оценки"
+
+    dist_to_resistance = (ext["high"] - current_price) if ext["high"] > current_price else float("inf")
+    dist_to_support = (current_price - ext["low"]) if ext["low"] < current_price else float("inf")
+
+    funding_positive = ticker["funding_rate"] > 0
+    closer_to_support = dist_to_support < dist_to_resistance
+
+    if funding_positive and closer_to_support:
+        meaning = "плюсы: фандинг положительный, цена ближе к поддержке"
+        action = "можно рассматривать покупку, лучше на подходе к уровню поддержки, стоп ниже уровня"
+    elif not funding_positive and not closer_to_support:
+        meaning = "минусы: фандинг отрицательный, цена ближе к сопротивлению"
+        action = "осторожнее с покупками, лучше дождаться отката или пробоя сопротивления"
+    else:
+        meaning = "смешанная картина, явного перевеса нет"
+        action = "без спешки, дождаться более чёткого сигнала у ближайшего уровня"
+
+    return meaning, action
+
+
+def format_message(symbol, ticker, timeframe_extremes):
+    price = ticker["price"]
+    magnets = compute_magnets(timeframe_extremes, price)
+    meaning, action = compute_verdict(ticker, timeframe_extremes, price)
+
     lines = [
-        f"🔴 {symbol} ({ticker['market']}) — цена {ticker['price']:.4f} "
+        f"🔴 {symbol} ({ticker['market']}) — цена {price:.4f} "
         f"· за сутки {ticker['change_pct']:+.2f}% "
         f"· оборот {ticker['volume_24h']/1_000_000:.1f} млн $",
         f"📈 Открытый интерес: {ticker['open_interest_usd']/1_000_000:.1f} млн $",
         f"🪁 Фандинг: {ticker['funding_rate']:+.4f}%",
-        f"🧲 Ближайшие уровни: {magnets}",
+        f"🧲 Ближайшие магниты: {magnets}",
+        f"🧠 Значит: {meaning}",
+        f"👉 Делай: {action}",
     ]
     return "\n".join(lines)
 
@@ -125,10 +201,9 @@ def main():
         raise SystemExit("Задай переменные окружения TELEGRAM_TOKEN и TELEGRAM_CHAT_ID")
 
     ticker = get_derivative_ticker(DERIV_SYMBOL, DERIV_EXCHANGE)
-    ohlc = get_ohlc(COIN_ID)
-    magnets = compute_magnets(ohlc, ticker["price"])
+    timeframe_extremes = get_multi_timeframe_extremes(COIN_ID)
 
-    message = format_message(DERIV_SYMBOL, ticker, magnets)
+    message = format_message(DERIV_SYMBOL, ticker, timeframe_extremes)
     send_telegram_message(message)
     print("Отправлено:\n", message)
 
