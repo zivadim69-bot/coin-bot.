@@ -1,0 +1,29 @@
+name: Telegram Command Bot
+
+on:
+  schedule:
+    # тест: запуск каждые 10 минут, со смещением от круглых минут
+    - cron: "3,13,23,33,43,53 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run command bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_COMMAND_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python telegram_command_bot.py
