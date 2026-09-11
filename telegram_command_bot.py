@@ -25,7 +25,7 @@ import os
 import requests
 
 from common import get_multi_timeframe_dex_extremes, format_levels, send_telegram_message
-from resolver import resolve_asset
+from resolver import resolve_asset, format_debug_token_pairs, debug_token_pairs
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -251,6 +251,43 @@ def main():
 
         if chat_id != str(TELEGRAM_CHAT_ID):
             continue  # игнорируем сообщения не из своего чата
+
+        if text.startswith("/debug_coin"):
+            parts = text.strip().split(maxsplit=1)
+            if len(parts) < 2:
+                reply = (
+                    "Использование: /debug_coin <тикер или контракт>\n"
+                    "Например: /debug_coin PUMP\n"
+                    "или: /debug_coin pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+                )
+            else:
+                query = parts[1].strip()
+                try:
+                    if _looks_like_contract(query):
+                        reply = format_debug_token_pairs(query)
+                    else:
+                        asset = resolve_asset(query)
+                        if not asset.get("resolved") or not asset.get("primary_address"):
+                            reply = (
+                                f"🔎 DEX DEBUG\nНе удалось однозначно определить '{query}'."
+                            )
+                            if asset.get("warnings"):
+                                reply += "\n" + "\n".join(
+                                    f"⚠️ {w}" for w in asset["warnings"]
+                                )
+                        else:
+                            reply = format_debug_token_pairs(asset["primary_address"])
+                            reply = (
+                                f"Запрос: {query}\n"
+                                f"CoinGecko: {asset.get('coingecko_id') or 'нет'}\n"
+                                f"Определённый контракт: {asset['primary_address']}\n\n"
+                                + reply
+                            )
+                except Exception as exc:
+                    reply = f"Не удалось получить DEX-пулы для диагностики: {type(exc).__name__}."
+            send_telegram_message(TELEGRAM_TOKEN, chat_id, reply)
+            print(f"Обработана команда: {text}")
+            continue
 
         if text.startswith("/coin") or text.startswith("/price"):
             reply = handle_command(text)

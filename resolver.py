@@ -141,6 +141,74 @@ def _dex_pairs_for_address(address):
         return []
 
 
+def debug_token_pairs(address, max_rows=30):
+    """
+    Диагностика всех DEX-пулов конкретного контракта.
+
+    ВАЖНО: функция ничего не меняет в resolver и не участвует в обычном
+    resolve_asset(). Она нужна только для проверки, какой именно pool
+    отдаёт подозрительную цену/ликвидность.
+    """
+    pairs = _dex_pairs_for_address(address)
+    rows = []
+
+    for p in pairs:
+        base = p.get("baseToken") or {}
+        quote = p.get("quoteToken") or {}
+        liquidity = float((p.get("liquidity") or {}).get("usd", 0) or 0)
+        volume_24h = float((p.get("volume") or {}).get("h24", 0) or 0)
+
+        try:
+            price = float(p.get("priceUsd") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+
+        rows.append({
+            "chain": str(p.get("chainId") or "?"),
+            "dex": str(p.get("dexId") or "?"),
+            "pair_address": str(p.get("pairAddress") or ""),
+            "base_symbol": str(base.get("symbol") or "?"),
+            "base_address": str(base.get("address") or ""),
+            "quote_symbol": str(quote.get("symbol") or "?"),
+            "quote_address": str(quote.get("address") or ""),
+            "price_usd": price,
+            "liquidity_usd": liquidity,
+            "volume_24h_usd": volume_24h,
+        })
+
+    rows.sort(key=lambda x: (x["liquidity_usd"], x["volume_24h_usd"]), reverse=True)
+    return rows[:max_rows]
+
+
+def format_debug_token_pairs(address, max_rows=30):
+    """Готовит компактный Telegram-отчёт по всем найденным DEX-пулам."""
+    rows = debug_token_pairs(address, max_rows=max_rows)
+    if not rows:
+        return f"🔎 DEX DEBUG\nКонтракт: {address}\n\nПулы не найдены."
+
+    lines = [
+        "🔎 DEX DEBUG",
+        f"Контракт: {address}",
+        f"Пулов найдено: {len(rows)}",
+        "",
+        "Сортировка: ликвидность ↓, затем объём ↓",
+        "",
+    ]
+
+    for i, r in enumerate(rows, 1):
+        price = r["price_usd"]
+        price_text = f"{price:.12g}" if price else "0"
+        lines.append(
+            f"{i}. {r['chain']} / {r['dex']} · "
+            f"{r['base_symbol']}/{r['quote_symbol']}\n"
+            f"   price=${price_text} · liq=${r['liquidity_usd']/1_000_000:.3f}M "
+            f"· vol24=${r['volume_24h_usd']/1_000_000:.3f}M\n"
+            f"   pair={r['pair_address']}"
+        )
+
+    return "\n".join(lines)
+
+
 def _dex_search_exact(query):
     """
     Фолбэк-поиск по тикеру/названию, когда монеты нет в CoinGecko.
