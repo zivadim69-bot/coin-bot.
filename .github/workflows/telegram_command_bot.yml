@@ -2,13 +2,14 @@ name: Telegram Command Bot
 
 on:
   schedule:
-    # каждые 5 минут - проверяет, не написал ли ты боту команду
-    - cron: "*/5 * * * *"
+    # каждые 5 минут, начиная с 03-й минуты часа
+    - cron: "3-59/5 * * * *"
   workflow_dispatch: {}
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
