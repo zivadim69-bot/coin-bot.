@@ -196,9 +196,10 @@ def format_asset_report(asset):
 
     if asset.get("primary_address"):
         lines.append(f"📍 Контракт ({asset.get('primary_chain') or '?'}): {asset['primary_address']}")
+    primary_addr_lower = (asset.get("primary_address") or "").lower()
     other_chains = {
         chain: addr for chain, addr in (asset.get("contracts") or {}).items()
-        if addr != asset.get("primary_address")
+        if addr.lower() != primary_addr_lower
     }
     if other_chains:
         lines.append("🔗 Другие сети: " + "; ".join(f"{ch}: {addr}" for ch, addr in other_chains.items()))
