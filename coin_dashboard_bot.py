@@ -24,7 +24,11 @@
 import os
 import requests
 
-from common import get_multi_timeframe_coingecko_extremes, format_levels, send_telegram_message
+from common import (
+    get_multi_timeframe_coingecko_extremes, get_bybit_ohlcv, find_swing_points,
+    build_level_zones, build_magnets, format_levels, format_advanced_levels,
+    send_telegram_message,
+)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -101,10 +105,39 @@ def compute_verdict(ticker, timeframe_extremes, current_price):
     return meaning, action
 
 
+def get_level_engine_v2(symbol, current_price):
+    """Получает OHLCV Bybit через BYBIT_API_BASE_URL и строит Level/Magnet Engine v2."""
+    if not os.environ.get("BYBIT_API_BASE_URL"):
+        return None, []
+    specs = [("15m", "15", 300), ("1H", "60", 300), ("4H", "240", 300), ("1D", "D", 365)]
+    levels_by_tf = {}
+    for label, interval, limit in specs:
+        try:
+            candles = get_bybit_ohlcv(symbol, interval, limit=limit)
+            points = find_swing_points(candles, left=3, right=3, min_range_pct=0.20)
+            zones = build_level_zones(points, current_price, merge_pct=0.35)
+            for z in zones:
+                z["score"] = min(100, 35 + min(z["tests"], 6) * 8)
+            levels_by_tf[label] = zones
+        except Exception as exc:
+            print(f"Level Engine v2 {label}: {exc}")
+    return levels_by_tf, build_magnets(levels_by_tf, current_price)
+
+
 def format_message(symbol, ticker, timeframe_extremes):
     price = ticker["price"]
-    magnets = format_levels(timeframe_extremes, price, decimals=4)
-    meaning, action = compute_verdict(ticker, timeframe_extremes, price)
+    levels_v2, magnets_v2 = get_level_engine_v2(symbol, price)
+    if levels_v2:
+        magnet_text = format_advanced_levels(levels_v2, price, decimals=4)
+        meaning_extremes = {
+            tf: {"high": max((z["high"] for z in zones), default=price),
+                 "low": min((z["low"] for z in zones), default=price)}
+            for tf, zones in levels_v2.items() if zones
+        }
+        meaning, action = compute_verdict(ticker, meaning_extremes, price)
+    else:
+        magnet_text = format_levels(timeframe_extremes, price, decimals=4) or "нет данных"
+        meaning, action = compute_verdict(ticker, timeframe_extremes, price)
 
     lines = [
         f"🔴 {symbol} ({ticker['market']}) — цена {price:.4f} "
@@ -112,7 +145,7 @@ def format_message(symbol, ticker, timeframe_extremes):
         f"· оборот {ticker['volume_24h']/1_000_000:.1f} млн $",
         f"📈 Открытый интерес: {ticker['open_interest_usd']/1_000_000:.1f} млн $",
         f"🪁 Фандинг: {ticker['funding_rate']:+.4f}%",
-        f"🧲 Ближайшие магниты: {magnets}",
+        f"🧲 Магниты: {magnet_text}",
         f"🧠 Значит: {meaning}",
         f"👉 Делай: {action}",
     ]
