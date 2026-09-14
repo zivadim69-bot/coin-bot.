@@ -92,6 +92,8 @@ def _agreement_counts(values, tolerance=0.000001):
 
 
 def _binance(symbol, reference_price):
+    started = time.time()
+    print(f"[CrossExchange] BINANCE START {symbol}", flush=True)
     if not BINANCE_BASE:
         raise RuntimeError("BINANCE_FAPI_BASE_URL не настроен")
     # These are independent public endpoints. Run them in parallel within the exchange too.
@@ -111,15 +113,19 @@ def _binance(symbol, reference_price):
         fs = {"funding": ex.submit(funding), "oi": ex.submit(oi), "ticker": ex.submit(ticker), "book": ex.submit(book)}
         out = {}
         for k, f in fs.items(): out[k] = f.result()
-    return {
+    result = {
         "exchange": "binance", "symbol": symbol,
         "funding_pct": out["funding"], "oi_usd": out["oi"],
         "volume_24h_usd": out["ticker"]["volume_24h"],
         "price": out["ticker"]["price"], "liquidity": out["book"], "ok": True,
     }
+    print(f'[CrossExchange] BINANCE OK {symbol} · OI=${result["oi_usd"]:,.0f} · Funding={result["funding_pct"]:+.4f}% · Vol=${result["volume_24h_usd"]:,.0f} · {time.time()-started:.2f}s', flush=True)
+    return result
 
 
 def _okx(symbol, reference_price):
+    started = time.time()
+    print(f"[CrossExchange] OKX START {symbol}", flush=True)
     if not OKX_BASE:
         raise RuntimeError("OKX_API_BASE_URL не настроен")
     inst = f"{_symbol_base(symbol)}-USDT-SWAP"
@@ -141,12 +147,14 @@ def _okx(symbol, reference_price):
         fs = {"funding": ex.submit(funding), "oi": ex.submit(oi), "ticker": ex.submit(ticker), "book": ex.submit(book)}
         out = {}
         for k, f in fs.items(): out[k] = f.result()
-    return {
+    result = {
         "exchange": "okx", "symbol": inst,
         "funding_pct": out["funding"], "oi_usd": out["oi"],
         "volume_24h_usd": out["ticker"]["volume_24h"],
         "price": out["ticker"]["price"], "liquidity": out["book"], "ok": True,
     }
+    print(f'[CrossExchange] OKX OK {symbol} · OI=${result["oi_usd"]:,.0f} · Funding={result["funding_pct"]:+.4f}% · Vol=${result["volume_24h_usd"]:,.0f} · {time.time()-started:.2f}s', flush=True)
+    return result
 
 
 def _bybit(symbol, reference_price):
@@ -170,13 +178,17 @@ def collect_cross_exchange(symbol, reference_price):
     funcs = {"bybit": _bybit, "binance": _binance, "okx": _okx}
     results = {}
     with ThreadPoolExecutor(max_workers=3) as ex:
+        print(f"[CrossExchange] START {symbol} · exchanges=Bybit,Binance,OKX", flush=True)
         futures = {name: ex.submit(fn, symbol, reference_price) for name, fn in funcs.items()}
         for name, future in futures.items():
             try:
                 results[name] = future.result()
             except Exception as exc:
+                print(f"[CrossExchange] {name.upper()} ERROR {symbol} · {type(exc).__name__}: {exc}", flush=True)
                 results[name] = {"exchange": name, "symbol": symbol, "ok": False,
                                  "error": f"{type(exc).__name__}: {exc}"}
+            else:
+                print(f"[CrossExchange] {name.upper()} RESULT {symbol} · OK", flush=True)
 
     good = [x for x in results.values() if x.get("ok")]
     funding = [x.get("funding_pct") for x in good]
@@ -185,6 +197,7 @@ def collect_cross_exchange(symbol, reference_price):
     # OI level agreement is intentionally NOT treated as directional agreement.
     # Directional OI agreement is computed from snapshot-to-snapshot deltas later.
     liquidity = {k: results[k].get("liquidity", []) for k in results}
+    print(f"[CrossExchange] DONE {symbol} · {len(good)}/3 exchanges OK", flush=True)
     return {
         "ts": int(time.time() * 1000),
         "symbol": symbol,
