@@ -542,6 +542,13 @@ def export_csv(path='magnet_research_results.csv',symbol=None):
     return len(rows)
 
 
+# Backward-compatible API name used by newer Telegram command layers.
+# It is an alias of the existing read-only CSV exporter and does not change
+# research/trading logic.
+def export_exchange_csv(path='magnet_research_results.csv', symbol=None):
+    return export_csv(path, symbol)
+
+
 def get_oi_dynamics(symbol, current_cross, now_ms=None):
     """Calculate OI change and acceleration from persisted 15m cross-exchange snapshots.
 
