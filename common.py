@@ -9,10 +9,24 @@ Level Engine v2:
 """
 
 import os
+import time
 import requests
 
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
-BYBIT_API_BASE = os.environ.get("BYBIT_API_BASE_URL", "https://api.bybit.com").rstrip("/")
+BYBIT_API_BASE = (os.environ.get("BYBIT_API_BASE_URL") or "").rstrip("/")
+
+_BYBIT_HEALTH = {"ok": None, "last_success_ms": None, "last_error": None, "last_error_ms": None}
+
+def bybit_configured():
+    """True only when the Bybit route is explicitly configured."""
+    return bool(BYBIT_API_BASE)
+
+def bybit_status():
+    return {"configured": bybit_configured(), **_BYBIT_HEALTH}
+
+def _require_bybit_configured():
+    if not BYBIT_API_BASE:
+        raise RuntimeError("BYBIT_API_BASE_URL не задан: Bybit-маршрут не настроен. Stage I research остановлен.")
 
 
 def get_multi_timeframe_coingecko_extremes(coin_id):
@@ -57,29 +71,74 @@ def get_multi_timeframe_dex_extremes(chain, pair_address):
 
 
 def _bybit_get(path, params):
-    """Bybit GET через RelaxDev или внешний gateway/proxy.
-    По умолчанию используется официальный Bybit API; при блокировке задаётся
-    BYBIT_API_BASE_URL на Cloudflare/другой gateway без изменения логики движка.
+    """Bybit GET через явно настроенный маршрут.
+
+    Stage I не использует неявный fallback на api.bybit.com: URL должен быть
+    задан в окружении RelaxDev (или указывать на внешний gateway/proxy).
     """
-    r = requests.get(f"{BYBIT_API_BASE}/{path.lstrip('/')}", params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("retCode", 0) != 0:
-        raise RuntimeError(f"Bybit API error: {data.get('retCode')} {data.get('retMsg')}")
-    return data.get("result", {})
+    _require_bybit_configured()
+    url = f"{BYBIT_API_BASE}/{path.lstrip('/')}"
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("retCode", 0) != 0:
+            raise RuntimeError(f"Bybit API error: {data.get('retCode')} {data.get('retMsg')}")
+        _BYBIT_HEALTH.update(ok=True, last_success_ms=int(time.time()*1000), last_error=None, last_error_ms=None)
+        return data.get("result", {})
+    except Exception as exc:
+        _BYBIT_HEALTH.update(ok=False, last_error=f"{type(exc).__name__}: {exc}", last_error_ms=int(time.time()*1000))
+        raise
 
 
-def get_bybit_ohlcv(symbol, interval, limit=500, category="linear"):
+def check_bybit_health(symbol="BTCUSDT"):
+    """Lightweight live health-check using the same configured Bybit route."""
+    try:
+        get_bybit_ticker(symbol)
+        return True, bybit_status()
+    except Exception as exc:
+        return False, {**bybit_status(), "error": f"{type(exc).__name__}: {exc}"}
+
+
+def get_bybit_ohlcv(symbol, interval, limit=500, category="linear", start=None, end=None):
     """OHLCV: [timestamp, open, high, low, close, volume, turnover]."""
-    result = _bybit_get("v5/market/kline", {
-        "category": category, "symbol": symbol.upper(), "interval": str(interval), "limit": int(limit)
-    })
+    params = {"category": category, "symbol": symbol.upper(), "interval": str(interval), "limit": int(limit)}
+    if start is not None: params["start"] = int(start)
+    if end is not None: params["end"] = int(end)
+    result = _bybit_get("v5/market/kline", params)
     rows = result.get("list", [])
     rows = list(reversed(rows))
     return [{
         "ts": int(x[0]), "open": float(x[1]), "high": float(x[2]), "low": float(x[3]),
         "close": float(x[4]), "volume": float(x[5]), "turnover": float(x[6])
     } for x in rows]
+
+
+def get_bybit_orderbook(symbol, category="linear", limit=100):
+    """Current Bybit linear order book through the configured Bybit route."""
+    result = _bybit_get("v5/market/orderbook", {"category": category, "symbol": symbol.upper(), "limit": int(limit)})
+    return {
+        "bids": result.get("b", []),
+        "asks": result.get("a", []),
+        "ts": result.get("ts"),
+    }
+
+
+def get_bybit_ticker(symbol, category="linear"):
+    """Current Bybit linear ticker: last price, 24h change/turnover, OI and funding."""
+    result = _bybit_get("v5/market/tickers", {"category": category, "symbol": symbol.upper()})
+    rows = result.get("list", [])
+    if not rows:
+        raise ValueError(f"Bybit ticker not found: {symbol}")
+    x = rows[0]
+    return {
+        "symbol": x.get("symbol", symbol.upper()),
+        "price": float(x.get("lastPrice") or 0),
+        "change_pct": float(x.get("price24hPcnt") or 0) * 100,
+        "volume_24h": float(x.get("turnover24h") or 0),
+        "open_interest_usd": float(x.get("openInterestValue") or 0),
+        "funding_rate": float(x.get("fundingRate") or 0) * 100,
+    }
 
 
 def _median(values):
@@ -140,54 +199,43 @@ def build_level_zones(points, current_price, merge_pct=0.35):
     return result
 
 
-def score_level(zone, current_price, timeframe_count=1):
-    """Прозрачный 0-100 score уровня, без ИИ."""
-    tests = min(zone.get("tests", 1), 6)
-    score = 35 + (tests - 1) * 8 + min(timeframe_count, 4) * 7
-    distance = abs(zone["price"] - current_price) / current_price * 100
-    if distance <= 0.5: score += 8
-    elif distance <= 1.0: score += 5
-    elif distance <= 2.0: score += 2
-    return min(100, int(score))
+def _timeframe_minutes(tf):
+    return {"15m": 15, "1H": 60, "4H": 240, "1D": 1440}.get(tf, 60)
 
 
-def build_magnets(levels_by_tf, current_price, max_magnets=4):
-    """Объединяет зоны разных TF. Magnet Score = уровень + multi-TF + близость + свежесть."""
-    candidates = []
-    for tf, zones in levels_by_tf.items():
-        for z in zones:
-            if z["price"] == current_price:
-                continue
-            candidates.append((tf, z))
-    if not candidates:
-        return []
-    groups = []
-    for tf, z in sorted(candidates, key=lambda x: x[1]["price"]):
-        found = None
-        for g in groups:
-            if abs(z["price"] - g["price"]) / current_price * 100 <= 0.35:
-                found = g; break
-        if found:
-            found["items"].append((tf, z)); found["price"] = _median([x[1]["price"] for x in found["items"]])
-        else:
-            groups.append({"price": z["price"], "items": [(tf, z)]})
-    magnets = []
+def compute_magnet_score(tests=1, timeframe_count=1, distance_pct=0.0, freshness_min=None, *, reaction_base=28, reaction_per_test=7, mtf_per_tf=8, proximity_weights=None, freshness_weights=None):
+    """Единый Magnet Score 0-100 для production и research."""
+    proximity_weights = proximity_weights or ((0.25,12),(0.5,10),(1.0,7),(2.0,4))
+    freshness_weights = freshness_weights or ((8,10),(24,6),(72,2))
+    tests=min(max(int(tests or 1),1),8)
+    score=reaction_base+(tests-1)*reaction_per_test+min(int(timeframe_count or 1),4)*mtf_per_tf
+    d=abs(float(distance_pct or 0.0))
+    for threshold,bonus in proximity_weights:
+        if d<=threshold: score+=bonus; break
+    if freshness_min is not None:
+        age_h=max(0.0,float(freshness_min))/60.0
+        for threshold_h,bonus in freshness_weights:
+            if age_h<=threshold_h: score+=bonus; break
+    return min(100,int(score))
+
+
+def build_magnets(levels_by_tf,current_price,max_magnets=4):
+    """Объединяет зоны разных TF и считает единый Magnet Score."""
+    candidates=[(tf,z) for tf,zones in levels_by_tf.items() for z in zones if z.get('price')!=current_price]
+    if not candidates:return []
+    groups=[]
+    for tf,z in sorted(candidates,key=lambda x:x[1]['price']):
+        g=next((g for g in groups if abs(z['price']-g['price'])/current_price*100<=0.35),None)
+        if g:g['items'].append((tf,z));g['price']=_median([x[1]['price'] for x in g['items']])
+        else:groups.append({'price':z['price'],'items':[(tf,z)]})
+    out=[]
     for g in groups:
-        tfs = {tf for tf, _ in g["items"]}
-        tests = sum(z.get("tests", 1) for _, z in g["items"])
-        distance = abs(g["price"] - current_price) / current_price * 100
-        score = 35 + min(tests, 8) * 5 + min(len(tfs), 4) * 8
-        if distance <= 0.5: score += 12
-        elif distance <= 1: score += 8
-        elif distance <= 2: score += 4
-        if distance <= 5: score += 5
-        magnets.append({
-            "price": g["price"], "side": "up" if g["price"] > current_price else "down",
-            "distance_pct": (g["price"] - current_price) / current_price * 100,
-            "score": min(100, int(score)), "timeframes": sorted(tfs), "tests": tests,
-        })
-    magnets.sort(key=lambda m: (abs(m["distance_pct"]), -m["score"]))
-    return magnets[:max_magnets]
+        tfs={tf for tf,_ in g['items']}; tests=sum(z.get('tests',1) for _,z in g['items']); d=(g['price']-current_price)/current_price*100
+        latest=max((z.get('last_ts',0) for _,z in g['items']),default=0); fresh=None
+        if latest:fresh=max(0.0,(time.time()*1000-float(latest))/60000.0)
+        out.append({'price':g['price'],'side':'up' if g['price']>current_price else 'down','distance_pct':d,'score':compute_magnet_score(tests,len(tfs),d,fresh),'timeframes':sorted(tfs),'tests':tests})
+    out.sort(key=lambda m:(abs(m['distance_pct']),-m['score']))
+    return out[:max_magnets]
 
 
 def format_advanced_levels(levels_by_tf, current_price, decimals=4):
