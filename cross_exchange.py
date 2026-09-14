@@ -1,197 +1,246 @@
-"""Cross-exchange market research layer.
+"""Cross-exchange market-data layer for Stage I.
 
-Public derivatives data only; no API keys and no trading actions.
-Primary exchanges: Bybit, Binance USD-M Futures, OKX USDT perpetual swaps.
+The three exchanges are queried independently and concurrently. A failure on
+one exchange never prevents the other exchanges from being queried.
 
-This module deliberately keeps the features independent from Magnet Score.
-Order-book zones are snapshots of visible resting depth, NOT liquidation maps.
+Supported: Bybit, Binance USDⓈ-M Futures, OKX USDT perpetual swaps.
+Liquidity means current order-book depth clusters, not liquidation-map data.
 """
+import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 
-from common import get_bybit_ticker, get_bybit_orderbook
+from common import BYBIT_API_BASE, get_bybit_ticker
 
-BINANCE_BASE = (os.environ.get("BINANCE_FAPI_BASE_URL") or "https://fapi.binance.com").rstrip("/")
-OKX_BASE = (os.environ.get("OKX_API_BASE_URL") or "https://www.okx.com").rstrip("/")
+BINANCE_BASE = (os.environ.get("BINANCE_FAPI_BASE_URL") or "").rstrip("/")
+OKX_BASE = (os.environ.get("OKX_API_BASE_URL") or "").rstrip("/")
+
+HTTP_TIMEOUT = 12
+BOOK_LIMIT = 50
 
 
-def _get_json(url, params=None, timeout=12):
-    r = requests.get(url, params=params or {}, timeout=timeout)
+def _http_get(base, path, params=None):
+    if not base:
+        raise RuntimeError("API base URL не настроен")
+    r = requests.get(f"{base}/{path.lstrip('/')}", params=params or {}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 
-def _binance(symbol):
-    symbol = symbol.upper()
-    price = _get_json(f"{BINANCE_BASE}/fapi/v1/ticker/price", {"symbol": symbol})
-    oi = _get_json(f"{BINANCE_BASE}/fapi/v1/openInterest", {"symbol": symbol})
-    funding = _get_json(f"{BINANCE_BASE}/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1})
-    depth = _get_json(f"{BINANCE_BASE}/fapi/v1/depth", {"symbol": symbol, "limit": 100})
-    p = float(price["price"])
-    oi_contracts = float(oi["openInterest"])
-    fr = float(funding[-1]["fundingRate"]) * 100 if funding else None
-    return {
-        "exchange": "Binance",
-        "symbol": symbol,
-        "price": p,
-        "funding_rate": fr,
-        "open_interest_usd": oi_contracts * p,
-        "orderbook": _depth_zones(depth.get("bids", []), depth.get("asks", []), p),
-        "captured_at": int(time.time() * 1000),
-    }
+def _symbol_base(symbol):
+    s = symbol.upper().replace("-", "")
+    if s.endswith("USDT"):
+        return s[:-4]
+    return s
 
 
-def _okx_inst(symbol):
-    base = symbol.upper().replace("USDT", "")
-    return f"{base}-USDT-SWAP"
-
-
-def _okx(symbol):
-    inst = _okx_inst(symbol)
-    ticker = _get_json(f"{OKX_BASE}/api/v5/market/ticker", {"instId": inst})
-    funding = _get_json(f"{OKX_BASE}/api/v5/public/funding-rate", {"instId": inst})
-    oi = _get_json(f"{OKX_BASE}/api/v5/public/open-interest", {"instType": "SWAP", "instId": inst})
-    depth = _get_json(f"{OKX_BASE}/api/v5/market/books", {"instId": inst, "sz": 100})
-    td = (ticker.get("data") or [None])[0]
-    fd = (funding.get("data") or [None])[0]
-    od = (oi.get("data") or [None])[0]
-    if not td:
-        raise ValueError(f"OKX ticker not found: {inst}")
-    p = float(td["last"])
-    fr = float(fd["fundingRate"]) * 100 if fd and fd.get("fundingRate") is not None else None
-    # OKX open interest is returned in contracts/base units for the instrument;
-    # convert to USD notional using current price.
-    oi_usd = float(od.get("oiUsd")) if od and od.get("oiUsd") not in (None, "") else None
-    oi_raw = float(od.get("oiCcy") or od.get("oi") or 0) if od else 0.0
-    return {
-        "exchange": "OKX",
-        "symbol": inst,
-        "price": p,
-        "funding_rate": fr,
-        "open_interest_usd": oi_usd if oi_usd is not None else oi_raw * p,
-        "orderbook": _depth_zones((depth.get("data") or [[[], []]])[0]["bids"], (depth.get("data") or [[[], []]])[0]["asks"], p) if depth.get("data") else {},
-        "captured_at": int(time.time() * 1000),
-    }
-
-
-def _depth_zones(bids, asks, price, band_pct=2.0, bins=20):
-    """Convert visible order-book depth into price-density zones.
-
-    Each zone stores aggregated USD notional. This is current visible depth only;
-    it is not a liquidation cluster and is not a historical liquidity map.
-    """
-    if not price:
-        return {"bid": [], "ask": []}
-    step = price * (band_pct / 100.0) / bins
-    if step <= 0:
-        return {"bid": [], "ask": []}
-    def side(rows, is_bid):
-        buckets = {}
-        for row in rows:
-            try:
-                px = float(row[0]); qty = float(row[1])
-            except Exception:
-                continue
-            dist = (price - px) if is_bid else (px - price)
-            if dist < 0 or dist > price * band_pct / 100:
-                continue
-            idx = min(bins - 1, int(dist / step))
-            buckets[idx] = buckets.get(idx, 0.0) + px * qty
-        out=[]
-        for idx, notional in buckets.items():
-            center_dist=(idx+0.5)*step
-            px=price-center_dist if is_bid else price+center_dist
-            out.append({"price": px, "notional_usd": notional, "distance_pct": (px-price)/price*100})
-        return sorted(out, key=lambda x:x["notional_usd"], reverse=True)[:5]
-    return {"bid": side(bids, True), "ask": side(asks, False)}
-
-
-def _bybit(symbol):
-    t = get_bybit_ticker(symbol)
-    depth = get_bybit_orderbook(symbol, limit=100)
-    return {
-        "exchange": "Bybit",
-        "symbol": symbol.upper(),
-        "price": t["price"],
-        "funding_rate": t["funding_rate"],
-        "open_interest_usd": t["open_interest_usd"],
-        "orderbook": _depth_zones(depth.get("bids", []), depth.get("asks", []), t["price"]),
-        "captured_at": int(time.time() * 1000),
-    }
-
-
-def collect_cross_exchange(symbol):
-    """Collect independent current features from Bybit/Binance/OKX.
-
-    One failed exchange does not fail the whole result. The returned `errors`
-    dictionary makes missing sources explicit instead of turning them into zeroes.
-    """
-    symbol = symbol.upper()
-    if not symbol.endswith("USDT"):
-        symbol += "USDT"
-    exchanges = {}
-    errors = {}
-    for name, fn in (("Bybit", _bybit), ("Binance", _binance), ("OKX", _okx)):
-        try:
-            exchanges[name] = fn(symbol)
-        except Exception as exc:
-            errors[name] = f"{type(exc).__name__}: {exc}"
-    return {
-        "symbol": symbol,
-        "exchanges": exchanges,
-        "errors": errors,
-        "agreement": _agreement(exchanges),
-        "captured_at": int(time.time() * 1000),
-    }
-
-
-def _agreement(exchanges):
-    vals = list(exchanges.values())
-    funding = [x["funding_rate"] for x in vals if x.get("funding_rate") is not None]
-    signs = [1 if x > 0 else -1 if x < 0 else 0 for x in funding]
-    funding_agree = sum(1 for s in signs if s == (1 if sum(signs) >= 0 else -1)) if signs else 0
-    prices = [x["price"] for x in vals if x.get("price")]
-    median_price = sorted(prices)[len(prices)//2] if prices else None
-    spread_pct = (max(prices)-min(prices))/median_price*100 if len(prices) >= 2 and median_price else None
-    return {
-        "available": len(vals),
-        "funding_sign_agreement": f"{funding_agree}/{len(signs)}" if signs else "n/a",
-        "funding_sign": "positive" if signs and sum(signs)>0 else "negative" if signs and sum(signs)<0 else "mixed/flat" if signs else "n/a",
-        "price_spread_pct": spread_pct,
-    }
-
-
-def format_cross_exchange(data, compact=False):
-    if not data:
+def _book_clusters(bids, asks, reference_price, max_clusters=3):
+    """Turn current order-book levels into compact near-price liquidity clusters."""
+    if not reference_price:
         return []
-    lines=["🌐 CROSS-EXCHANGE RESEARCH"]
-    for name in ("Bybit", "Binance", "OKX"):
-        x=data.get("exchanges",{}).get(name)
-        if not x:
-            err=data.get("errors",{}).get(name,"unavailable")
-            lines.append(f"{name}: ❌ {err[:100]}")
+    rows = []
+    for side, levels in (("bid", bids), ("ask", asks)):
+        for row in levels:
+            if len(row) < 2:
+                continue
+            try:
+                price = float(row[0]); qty = float(row[1])
+            except (TypeError, ValueError):
+                continue
+            if price <= 0 or qty <= 0:
+                continue
+            dist = abs(price - reference_price) / reference_price * 100
+            if dist <= 5.0:
+                rows.append((side, price, price * qty, dist))
+    # Group levels in 0.10% price buckets; this is a depth-density proxy.
+    grouped = {}
+    for side, price, notional, dist in rows:
+        bucket = round((price / reference_price - 1.0) * 100 / 0.10) * 0.10
+        key = (side, round(bucket, 4))
+        g = grouped.setdefault(key, {"side": side, "price_sum": 0.0, "notional": 0.0, "levels": 0})
+        g["price_sum"] += price * notional
+        g["notional"] += notional
+        g["levels"] += 1
+    out = []
+    for g in grouped.values():
+        price = g["price_sum"] / g["notional"] if g["notional"] else reference_price
+        out.append({
+            "side": g["side"],
+            "price": price,
+            "distance_pct": (price - reference_price) / reference_price * 100,
+            "notional_usd": g["notional"],
+            "levels": g["levels"],
+        })
+    out.sort(key=lambda x: x["notional_usd"], reverse=True)
+    return out[:max_clusters]
+
+
+def _agreement_counts(values, tolerance=0.000001):
+    vals = [v for v in values if v is not None]
+    if len(vals) < 2:
+        return {"available": len(vals), "same_sign": None}
+    signs = [1 if v > tolerance else -1 if v < -tolerance else 0 for v in vals]
+    nonzero = [s for s in signs if s]
+    if not nonzero:
+        same = len(vals)
+    else:
+        same = max(nonzero.count(1), nonzero.count(-1)) + signs.count(0)
+    return {"available": len(vals), "same_sign": same}
+
+
+def _binance(symbol, reference_price):
+    if not BINANCE_BASE:
+        raise RuntimeError("BINANCE_FAPI_BASE_URL не настроен")
+    # These are independent public endpoints. Run them in parallel within the exchange too.
+    def funding():
+        d = _http_get(BINANCE_BASE, "/fapi/v1/premiumIndex", {"symbol": symbol})
+        return float(d.get("lastFundingRate") or 0) * 100
+    def oi():
+        d = _http_get(BINANCE_BASE, "/fapi/v1/openInterest", {"symbol": symbol})
+        return float(d.get("openInterest") or 0) * reference_price
+    def ticker():
+        d = _http_get(BINANCE_BASE, "/fapi/v1/ticker/24hr", {"symbol": symbol})
+        return {"volume_24h": float(d.get("quoteVolume") or 0), "price": float(d.get("lastPrice") or 0)}
+    def book():
+        d = _http_get(BINANCE_BASE, "/fapi/v1/depth", {"symbol": symbol, "limit": BOOK_LIMIT})
+        return _book_clusters(d.get("bids", []), d.get("asks", []), reference_price)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        fs = {"funding": ex.submit(funding), "oi": ex.submit(oi), "ticker": ex.submit(ticker), "book": ex.submit(book)}
+        out = {}
+        for k, f in fs.items(): out[k] = f.result()
+    return {
+        "exchange": "binance", "symbol": symbol,
+        "funding_pct": out["funding"], "oi_usd": out["oi"],
+        "volume_24h_usd": out["ticker"]["volume_24h"],
+        "price": out["ticker"]["price"], "liquidity": out["book"], "ok": True,
+    }
+
+
+def _okx(symbol, reference_price):
+    if not OKX_BASE:
+        raise RuntimeError("OKX_API_BASE_URL не настроен")
+    inst = f"{_symbol_base(symbol)}-USDT-SWAP"
+    def funding():
+        d = _http_get(OKX_BASE, "/api/v5/public/funding-rate", {"instId": inst})
+        return float(d["data"][0].get("fundingRate") or 0) * 100
+    def oi():
+        d = _http_get(OKX_BASE, "/api/v5/public/open-interest", {"instType": "SWAP", "instId": inst})
+        return float(d["data"][0].get("oiUsd") or 0)
+    def ticker():
+        d = _http_get(OKX_BASE, "/api/v5/market/ticker", {"instId": inst})
+        x = d["data"][0]
+        return {"volume_24h": float(x.get("volCcy24h") or 0) * float(x.get("last") or 0), "price": float(x.get("last") or 0)}
+    def book():
+        d = _http_get(OKX_BASE, "/api/v5/market/books", {"instId": inst, "sz": BOOK_LIMIT})
+        x = d["data"][0]
+        return _book_clusters(x.get("bids", []), x.get("asks", []), reference_price)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        fs = {"funding": ex.submit(funding), "oi": ex.submit(oi), "ticker": ex.submit(ticker), "book": ex.submit(book)}
+        out = {}
+        for k, f in fs.items(): out[k] = f.result()
+    return {
+        "exchange": "okx", "symbol": inst,
+        "funding_pct": out["funding"], "oi_usd": out["oi"],
+        "volume_24h_usd": out["ticker"]["volume_24h"],
+        "price": out["ticker"]["price"], "liquidity": out["book"], "ok": True,
+    }
+
+
+def _bybit(symbol, reference_price):
+    if not BYBIT_API_BASE:
+        raise RuntimeError("BYBIT_API_BASE_URL не настроен")
+    t = get_bybit_ticker(symbol)
+    # Order book is public; use the same explicitly configured Bybit route.
+    d = _http_get(BYBIT_API_BASE, "/v5/market/orderbook", {"category": "linear", "symbol": symbol, "limit": BOOK_LIMIT})
+    result = d.get("result", {})
+    return {
+        "exchange": "bybit", "symbol": symbol,
+        "funding_pct": t["funding_rate"], "oi_usd": t["open_interest_usd"],
+        "volume_24h_usd": t["volume_24h"], "price": t["price"],
+        "liquidity": _book_clusters(result.get("b", []), result.get("a", []), reference_price), "ok": True,
+    }
+
+
+def collect_cross_exchange(symbol, reference_price):
+    """Collect all exchanges concurrently; failures are isolated per exchange."""
+    symbol = symbol.upper()
+    funcs = {"bybit": _bybit, "binance": _binance, "okx": _okx}
+    results = {}
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {name: ex.submit(fn, symbol, reference_price) for name, fn in funcs.items()}
+        for name, future in futures.items():
+            try:
+                results[name] = future.result()
+            except Exception as exc:
+                results[name] = {"exchange": name, "symbol": symbol, "ok": False,
+                                 "error": f"{type(exc).__name__}: {exc}"}
+
+    good = [x for x in results.values() if x.get("ok")]
+    funding = [x.get("funding_pct") for x in good]
+    oi = [x.get("oi_usd") for x in good]
+    funding_ag = _agreement_counts(funding, tolerance=1e-8)
+    # OI level agreement is intentionally NOT treated as directional agreement.
+    # Directional OI agreement is computed from snapshot-to-snapshot deltas later.
+    liquidity = {k: results[k].get("liquidity", []) for k in results}
+    return {
+        "ts": int(time.time() * 1000),
+        "symbol": symbol,
+        "exchanges": results,
+        "available": len(good),
+        "funding_agreement": funding_ag,
+        "liquidity_overlap": liquidity_overlap(liquidity, reference_price),
+    }
+
+
+def liquidity_overlap(liquidity_by_exchange, reference_price, tolerance_pct=0.25):
+    clusters = []
+    for ex, rows in liquidity_by_exchange.items():
+        for r in rows:
+            clusters.append({"exchange": ex, **r})
+    overlaps = []
+    for i, a in enumerate(clusters):
+        group = [a]
+        for b in clusters[i + 1:]:
+            if a["side"] != b["side"]:
+                continue
+            if abs(a["price"] - b["price"]) / reference_price * 100 <= tolerance_pct:
+                group.append(b)
+        exs=sorted(set(x["exchange"] for x in group))
+        if len(exs) >= 2:
+            notional=sum(x.get("notional_usd",0) for x in group)
+            price=sum(x["price"]*x.get("notional_usd",0) for x in group)/max(notional,1)
+            overlaps.append({"side":a["side"],"price":price,"exchanges":exs,"notional_usd":notional})
+    uniq={}
+    for x in overlaps:
+        key=(x["side"],tuple(x["exchanges"]),round(x["price"]/reference_price,4))
+        uniq[key]=x
+    return sorted(uniq.values(), key=lambda x:x["notional_usd"], reverse=True)[:6]
+
+
+def compact_summary(payload):
+    """Small Telegram-friendly summary without raw order-book payloads."""
+    lines=[]
+    for name in ("bybit","binance","okx"):
+        x=payload.get("exchanges",{}).get(name,{})
+        label=name.upper()
+        if not x.get("ok"):
+            lines.append(f"{label}: ❌ {x.get('error','unavailable')}")
             continue
-        fr=x.get("funding_rate"); oi=x.get("open_interest_usd")
-        frs=f"{fr:+.4f}%" if fr is not None else "n/a"
-        ois=f"${oi/1_000_000:.1f}M" if oi is not None else "n/a"
-        lines.append(f"{name}: price {_fmt(x['price'])} · Funding {frs} · OI {ois}")
-        if not compact:
-            for side, label in (("bid","🟢 bid depth"),("ask","🔴 ask depth")):
-                zones=(x.get("orderbook") or {}).get(side,[])[:2]
-                if zones:
-                    z="; ".join(f"{_fmt(a['price'])} ${a['notional_usd']/1_000_000:.2f}M" for a in zones)
-                    lines.append(f"  {label}: {z}")
-    a=data.get("agreement",{})
-    lines.append(f"Agreement: funding {a.get('funding_sign_agreement','n/a')} · price spread {a.get('price_spread_pct',0):.3f}%" if a.get('price_spread_pct') is not None else f"Agreement: funding {a.get('funding_sign_agreement','n/a')} · price spread n/a")
-    if data.get("errors"):
-        lines.append("ℹ️ Недоступная биржа не считается нулём и не загрязняет статистику.")
-    lines.append("ℹ️ Depth zones = текущая видимая ликвидность стакана; это не карта ликвидаций.")
-    return lines
+        lines.append(f"{label}: Funding {x.get('funding_pct',0):+.4f}% · OI ${x.get('oi_usd',0)/1e6:.1f}M · Vol ${x.get('volume_24h_usd',0)/1e6:.1f}M")
+    fa=payload.get("funding_agreement",{})
+    if fa.get("same_sign") is not None:
+        lines.append(f"Funding agreement: {fa['same_sign']}/{fa['available']}")
+    ov=payload.get("liquidity_overlap",[])
+    if ov:
+        parts=[f"{x['side']} {x['price']:.6g} ({'/'.join(x['exchanges'])})" for x in ov[:3]]
+        lines.append("Liquidity overlap: " + " · ".join(parts))
+    else:
+        lines.append("Liquidity overlap: нет совпадающих зон")
+    return "\n".join(lines)
 
 
-def _fmt(p):
-    if p >= 100: return f"{p:.2f}"
-    if p >= 1: return f"{p:.4f}"
-    if p >= .01: return f"{p:.5f}"
-    return f"{p:.8f}"
+def payload_json(payload):
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

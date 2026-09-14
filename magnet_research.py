@@ -14,16 +14,16 @@ for a snapshot after those confirmation candles have closed.
 """
 
 import csv
+import json
 import math
 import os
 import sqlite3
 import time
-import json
 from collections import defaultdict
 from pathlib import Path
 
 from common import get_bybit_ohlcv, get_bybit_ticker, find_swing_points, build_level_zones, compute_magnet_score
-from cross_exchange import collect_cross_exchange, format_cross_exchange
+from cross_exchange import collect_cross_exchange, payload_json, compact_summary
 
 DB_PATH = os.environ.get("MAGNET_DB_PATH", "magnet_research.sqlite3")
 RESEARCH_SYMBOLS = [x.strip().upper() for x in os.environ.get("MAGNET_RESEARCH_SYMBOLS", "VVVUSDT,ENAUSDT").split(",") if x.strip()]
@@ -75,23 +75,17 @@ def init_db():
     );
     CREATE INDEX IF NOT EXISTS idx_mc_symbol_ts ON magnet_candidates(symbol, snapshot_id);
     CREATE INDEX IF NOT EXISTS idx_mc_source_score ON magnet_candidates(source, score);
-    CREATE TABLE IF NOT EXISTS exchange_snapshots (
+    CREATE TABLE IF NOT EXISTS cross_exchange_snapshots (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       snapshot_id INTEGER NOT NULL,
       symbol TEXT NOT NULL,
-      exchange TEXT NOT NULL,
-      price REAL,
-      funding_rate REAL,
-      open_interest_usd REAL,
-      oi_delta_pct REAL,
-      orderbook_zones_json TEXT,
-      funding_sign TEXT,
-      captured_at INTEGER NOT NULL,
-      error TEXT,
-      UNIQUE(snapshot_id, exchange),
-      FOREIGN KEY(snapshot_id) REFERENCES magnet_snapshots(id)
+      snapshot_ts INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      payload_json TEXT NOT NULL,
+      FOREIGN KEY(snapshot_id) REFERENCES magnet_snapshots(id),
+      UNIQUE(symbol, snapshot_ts)
     );
-    CREATE INDEX IF NOT EXISTS idx_ex_symbol_exchange_ts ON exchange_snapshots(symbol, exchange, captured_at);
+    CREATE INDEX IF NOT EXISTS idx_ces_symbol_ts ON cross_exchange_snapshots(symbol, snapshot_ts);
     """)
     conn.commit(); conn.close()
 
@@ -320,6 +314,15 @@ def fetch_all(symbol, limits_override=None):
     return data
 
 
+def save_cross_exchange_snapshot(snapshot_id, symbol, snapshot_ts, price):
+    payload = collect_cross_exchange(symbol, price)
+    conn = _db()
+    conn.execute("INSERT OR REPLACE INTO cross_exchange_snapshots(snapshot_id,symbol,snapshot_ts,created_at,payload_json) VALUES(?,?,?,?,?)",
+                 (snapshot_id, symbol, snapshot_ts, int(time.time()), payload_json(payload)))
+    conn.commit(); conn.close()
+    return payload
+
+
 def snapshot_symbol(symbol, source='periodic'):
     data=fetch_all(symbol)
     if not data.get('15m'): return None
@@ -340,26 +343,12 @@ def snapshot_symbol(symbol, source='periodic'):
         score=research_score({**c,'distance_pct':d})
         cur.execute("INSERT INTO magnet_candidates(snapshot_id,symbol,magnet_price,side,source,score,distance_pct,tests,timeframes,freshness_min) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (sid,symbol,c['price'],c['side'],c['source'],score,d,c.get('tests',1),c.get('timeframes',''),c.get('freshness_min')))
-    # Cross-exchange features are research metadata only; they never change Magnet Score.
-    cross=collect_cross_exchange(symbol)
-    _store_cross_exchange(cur, sid, symbol, cross)
-    conn.commit(); conn.close(); return sid,len(raw)
-
-def _store_cross_exchange(cur, snapshot_id, symbol, data):
-    """Persist one row per exchange; missing exchanges remain explicit errors."""
-    for name in ("Bybit", "Binance", "OKX"):
-        x=data.get("exchanges",{}).get(name)
-        err=data.get("errors",{}).get(name)
-        prev=cur.execute("SELECT open_interest_usd FROM exchange_snapshots WHERE symbol=? AND exchange=? AND error IS NULL ORDER BY captured_at DESC LIMIT 1",(symbol,name)).fetchone()
-        prev_oi=prev[0] if prev else None
-        oi_delta=None
-        if x and prev_oi and prev_oi>0 and x.get("open_interest_usd") is not None:
-            oi_delta=(x["open_interest_usd"]-prev_oi)/prev_oi*100
-        fr=x.get("funding_rate") if x else None
-        sign="positive" if fr is not None and fr>0 else "negative" if fr is not None and fr<0 else "flat" if fr is not None else None
-        cur.execute("INSERT OR REPLACE INTO exchange_snapshots(snapshot_id,symbol,exchange,price,funding_rate,open_interest_usd,oi_delta_pct,orderbook_zones_json,funding_sign,captured_at,error) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (snapshot_id,symbol,name,x.get("price") if x else None,fr,x.get("open_interest_usd") if x else None,oi_delta,json.dumps(x.get("orderbook",{}),separators=(",",":")) if x else None,sign,int(x.get("captured_at",time.time()*1000)) if x else int(time.time()*1000),err))
-
+    conn.commit(); conn.close()
+    try:
+        save_cross_exchange_snapshot(sid, symbol, snapshot_ts, price)
+    except Exception as exc:
+        print(f"[CrossExchange] {symbol}: {type(exc).__name__}: {exc}")
+    return sid,len(raw)
 
 def evaluate_pending(symbol=None, max_rows=5000):
     """Evaluate completed 24h windows using one 15m history fetch per symbol."""
@@ -399,6 +388,131 @@ def evaluate_pending(symbol=None, max_rows=5000):
 def current_market(symbol):
     return get_bybit_ticker(symbol)
 
+
+def _volume_usd(candle):
+    """Prefer quote turnover (USD) and fall back to base volume * close."""
+    turnover = float(candle.get('turnover') or 0.0)
+    if turnover > 0:
+        return turnover
+    return float(candle.get('volume') or 0.0) * float(candle.get('close') or 0.0)
+
+
+def _pressure_proxy(candle):
+    """OHLCV-only directional-pressure proxy, not true aggressor-side volume.
+
+    Close near the high => positive pressure; close near the low => negative.
+    This deliberately does not call the result CVD/buy volume/sell volume.
+    """
+    hi, lo, close = float(candle['high']), float(candle['low']), float(candle['close'])
+    rng = hi - lo
+    if rng <= 0:
+        return 0.0
+    return max(-100.0, min(100.0, ((2.0 * close - hi - lo) / rng) * 100.0))
+
+
+def _aggregate_5m_to_10m(candles):
+    """Build aligned 10m candles from closed 5m OHLCV candles."""
+    groups = {}
+    step = 10 * 60 * 1000
+    for c in candles:
+        ts = (int(c['ts']) // step) * step
+        groups.setdefault(ts, []).append(c)
+    out = []
+    for ts in sorted(groups):
+        rows = sorted(groups[ts], key=lambda x: x['ts'])
+        # Require two 5m candles so a partial/missing half-window cannot create a false 10m candle.
+        if len(rows) != 2:
+            continue
+        out.append({
+            'ts': ts,
+            'open': rows[0]['open'],
+            'high': max(x['high'] for x in rows),
+            'low': min(x['low'] for x in rows),
+            'close': rows[-1]['close'],
+            'volume': sum(x.get('volume', 0.0) for x in rows),
+            'turnover': sum(x.get('turnover', 0.0) for x in rows),
+        })
+    return out
+
+
+def volume_pressure_dynamics(candles_by_tf, now_ms=None, window=5, recent=2):
+    """Return multi-TF volume + pressure dynamics from CLOSED candles only.
+
+    For each timeframe: total USD volume and volume-weighted pressure over the
+    last five closed candles; volume acceleration compares average volume of
+    the latest two candles with the preceding three; pressure momentum compares
+    the same two groups. This is a research/display layer and never changes
+    trading score/gates.
+    """
+    now_ms = int(now_ms or time.time() * 1000)
+    tf_minutes = {'5m': 5, '10m': 10, '15m': 15}
+    result = {}
+    for tf, minutes in tf_minutes.items():
+        source = candles_by_tf.get(tf, [])
+        if tf == '10m':
+            # 10m is synthesized from 5m because it is not a native Bybit kline interval.
+            source = _aggregate_5m_to_10m(candles_by_tf.get('5m', []))
+        step_ms = minutes * 60 * 1000
+        closed = [c for c in source if int(c['ts']) + step_ms <= now_ms]
+        if len(closed) < window:
+            result[tf] = {'ok': False, 'reason': 'not_enough_closed_candles'}
+            continue
+        rows = closed[-window:]
+        prev = rows[:-recent]
+        last = rows[-recent:]
+
+        vols = [_volume_usd(c) for c in rows]
+        prev_vol = sum(_volume_usd(c) for c in prev) / len(prev) if prev else 0.0
+        recent_vol = sum(_volume_usd(c) for c in last) / len(last) if last else 0.0
+        vol_accel_pct = ((recent_vol / prev_vol) - 1.0) * 100.0 if prev_vol > 0 else None
+
+        def weighted_pressure(items):
+            total = sum(_volume_usd(c) for c in items)
+            if total <= 0:
+                return 0.0
+            return sum(_volume_usd(c) * _pressure_proxy(c) for c in items) / total
+
+        pressure = weighted_pressure(rows)
+        prev_pressure = weighted_pressure(prev)
+        recent_pressure = weighted_pressure(last)
+        pressure_momentum_pp = recent_pressure - prev_pressure
+        latest = rows[-1]
+        result[tf] = {
+            'ok': True,
+            'candles': window,
+            'recent_candles': recent,
+            'volume_usd': sum(vols),
+            'avg_volume_usd': sum(vols) / len(vols),
+            'recent_avg_volume_usd': recent_vol,
+            'previous_avg_volume_usd': prev_vol,
+            'volume_accel_pct': vol_accel_pct,
+            'pressure_pct': pressure,
+            'previous_pressure_pct': prev_pressure,
+            'recent_pressure_pct': recent_pressure,
+            'pressure_momentum_pp': pressure_momentum_pp,
+            'latest_volume_usd': _volume_usd(latest),
+            'latest_pressure_pct': _pressure_proxy(latest),
+            'last_ts': int(latest['ts']),
+        }
+    return result
+
+
+def _fmt_usd_volume(v):
+    v = float(v or 0.0)
+    if v >= 1_000_000_000:
+        return f"${v/1_000_000_000:.2f}B"
+    if v >= 1_000_000:
+        return f"${v/1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"${v/1_000:.0f}K"
+    return f"${v:.0f}"
+
+
+def _fmt_direction(value, suffix=''):
+    if value is None:
+        return 'n/a'
+    return f"{value:+.1f}{suffix}"
+
 def stats(symbol=None):
     conn=_db(); where=" WHERE touch_24h IS NOT NULL"; params=[]
     if symbol: where+=" AND symbol=?"; params.append(symbol)
@@ -428,6 +542,58 @@ def export_csv(path='magnet_research_results.csv',symbol=None):
     return len(rows)
 
 
+def get_oi_dynamics(symbol, current_cross, now_ms=None):
+    """Calculate OI change and acceleration from persisted 15m cross-exchange snapshots.
+
+    Acceleration is defined as: ΔOI over the latest 15m minus the 30m ΔOI
+    normalized to a 15m rate. Positive means the short-term OI growth rate is
+    increasing; negative means it is slowing. Historical values are used only
+    for research/display and never modify scoring or filters.
+    """
+    now_ms = int(now_ms or time.time() * 1000)
+    conn = _db()
+    rows = conn.execute(
+        "SELECT snapshot_ts,payload_json FROM cross_exchange_snapshots "
+        "WHERE symbol=? AND snapshot_ts<=? ORDER BY snapshot_ts DESC LIMIT 20",
+        (symbol, now_ms),
+    ).fetchall()
+    conn.close()
+
+    history = []
+    for row in rows:
+        try:
+            history.append((int(row['snapshot_ts']), json.loads(row['payload_json'])))
+        except Exception:
+            continue
+
+    def oi_at_or_before(target_ms, exchange):
+        for ts, payload in history:
+            if ts > target_ms:
+                continue
+            x = (payload.get('exchanges') or {}).get(exchange) or {}
+            if x.get('ok') and x.get('oi_usd') is not None:
+                return float(x['oi_usd']), ts
+        return None, None
+
+    out = {}
+    for exchange, current in (current_cross.get('exchanges') or {}).items():
+        if not current.get('ok') or current.get('oi_usd') is None:
+            continue
+        oi_now = float(current['oi_usd'])
+        oi15, ts15 = oi_at_or_before(now_ms - 15 * 60 * 1000, exchange)
+        oi30, ts30 = oi_at_or_before(now_ms - 30 * 60 * 1000, exchange)
+        item = {'oi_usd': oi_now, 'delta_15m_pct': None, 'delta_30m_pct': None,
+                'accel_15m_pp': None, 'ts15': ts15, 'ts30': ts30}
+        if oi15 and oi15 > 0:
+            item['delta_15m_pct'] = (oi_now / oi15 - 1.0) * 100.0
+        if oi30 and oi30 > 0:
+            item['delta_30m_pct'] = (oi_now / oi30 - 1.0) * 100.0
+        if item['delta_15m_pct'] is not None and item['delta_30m_pct'] is not None:
+            item['accel_15m_pp'] = item['delta_15m_pct'] - item['delta_30m_pct'] / 2.0
+        out[exchange] = item
+    return out
+
+
 def current_analysis(symbol):
     symbol=symbol.upper()
     if not symbol.endswith('USDT'): symbol+='USDT'
@@ -437,8 +603,10 @@ def current_analysis(symbol):
     candidates=merge_candidates(build_research_candidates(data,price),price)
     # Profile summary from 15m/1H.
     vp={tf:volume_profile(data.get(tf,[])) for tf in ('15m','1H','4H')}
-    cross=collect_cross_exchange(symbol)
-    return {'symbol':symbol,'price':price,'candles':data,'magnets':candidates,'vp':vp,'cross_exchange':cross}
+    cross=collect_cross_exchange(symbol, price)
+    oi_dynamics=get_oi_dynamics(symbol, cross)
+    volume_dynamics=volume_pressure_dynamics(data)
+    return {'symbol':symbol,'price':price,'candles':data,'magnets':candidates,'vp':vp,'cross_exchange':cross,'oi_dynamics':oi_dynamics,'volume_dynamics':volume_dynamics}
 
 
 def format_current_report(analysis):
@@ -447,7 +615,16 @@ def format_current_report(analysis):
     try:
         t=current_market(s)
         lines.append(f"📊 24h: {t['change_pct']:+.2f}% · оборот {t['volume_24h']/1_000_000:.1f} млн $")
-        lines.append(f"📈 OI: {t['open_interest_usd']/1_000_000:.1f} млн $ · Funding: {t['funding_rate']:+.4f}%")
+        oi_line=f"📈 OI: {t['open_interest_usd']/1_000_000:.1f} млн $"
+        dyn=(analysis.get('oi_dynamics') or {}).get('bybit') or {}
+        if dyn.get('delta_15m_pct') is not None:
+            oi_line += f" · Δ15m {dyn['delta_15m_pct']:+.2f}%"
+        if dyn.get('accel_15m_pp') is not None:
+            oi_line += f" · OI accel {dyn['accel_15m_pp']:+.2f}pp/15m"
+        else:
+            oi_line += " · OI accel n/a"
+        oi_line += f" · Funding: {t['funding_rate']:+.4f}%"
+        lines.append(oi_line)
     except Exception:
         pass
     c15=data.get('15m',[])
@@ -457,11 +634,30 @@ def format_current_report(analysis):
         rvol=vol_now/vol_base if vol_base else 0
         lines.append(f"📈 Price Action 1h: {change:+.2f}% · RVOL≈{rvol:.2f}x")
     lines.append("")
+    lines.append("📊 VOLUME / PRESSURE — 5 ЗАКРЫТЫХ СВЕЧЕЙ")
+    vd=analysis.get('volume_dynamics') or {}
+    for tf in ('5m','10m','15m'):
+        x=vd.get(tf) or {}
+        if not x.get('ok'):
+            lines.append(f"{tf}×5: n/a")
+            continue
+        lines.append(
+            f"{tf}×5: {_fmt_usd_volume(x['volume_usd'])} · P {_fmt_direction(x['pressure_pct'],'%')}"
+            f" · Vol accel {_fmt_direction(x['volume_accel_pct'],'%')}"
+            f" · P-mom {_fmt_direction(x['pressure_momentum_pp'],'pp')}"
+            f" · last {_fmt_usd_volume(x['latest_volume_usd'])}/{_fmt_direction(x['latest_pressure_pct'],'%')}"
+        )
+    lines.append("ℹ️ Pressure — OHLCV-прокси; фактический агрессорный buy/sell и текущую незакрытую свечу не видим.")
+    lines.append("")
     lines.append("🧲 МАГНИТЫ / ЗОНЫ")
     for m in mags[:8]:
         arrow='⬆️' if m['side']=='up' else '⬇️'
         lines.append(f"{arrow} {_fmt_price(m['price'])} ({m['distance_pct']:+.2f}%) · research score {m['score']:.0f} · {','.join(m['sources'])} · MTF {','.join(m['timeframes']) or '-'}")
     if not mags: lines.append("нет данных")
+    cross=analysis.get('cross_exchange',{})
+    lines.append("")
+    lines.append("🌐 CROSS-EXCHANGE")
+    lines.append(compact_summary(cross))
     lines.append("")
     lines.append("📊 VOLUME PROFILE")
     for tf in ('15m','1H','4H'):
@@ -478,21 +674,7 @@ def format_current_report(analysis):
         for x in sorted(liq,key=lambda z:abs(z['price']-p))[:5]: lines.append(f"{_fmt_price(x['price'])} · density/volume cluster")
     lines.append(""); lines.append("⏱ MTF: 15m / 1H / 4H / 1D · данные Bybit")
     lines.append("ℹ️ Liquidity здесь — OHLCV-прокси, не стакан и не карта ликвидаций.")
-    lines.append("")
-    lines.extend(format_cross_exchange(analysis.get('cross_exchange'), compact=False))
     return '\n'.join(lines)
-
-
-def export_exchange_csv(path='exchange_research_results.csv',symbol=None):
-    conn=_db(); q="SELECT e.*,s.snapshot_ts,s.current_price AS snapshot_price,s.source AS snapshot_source FROM exchange_snapshots e JOIN magnet_snapshots s ON s.id=e.snapshot_id"; params=[]
-    if symbol:
-        q+=" WHERE e.symbol=?"; params.append(symbol.upper())
-    q+=" ORDER BY e.snapshot_ts,e.exchange"
-    rows=conn.execute(q,params).fetchall(); conn.close()
-    if not rows:return 0
-    with open(path,'w',newline='',encoding='utf-8') as f:
-        w=csv.writer(f); w.writerow(rows[0].keys()); w.writerows([tuple(r) for r in rows])
-    return len(rows)
 
 
 def ensure_research_history():
