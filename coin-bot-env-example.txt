@@ -1,0 +1,20 @@
+# coin-bot — RelaxDev environment
+# Заполни своими значениями. Секреты не публикуй в GitHub.
+
+# Telegram
+TELEGRAM_BOT_TOKEN=
+
+# Bybit — ОБЯЗАТЕЛЬНО для Stage I / Cross-Exchange
+# Используй рабочий base URL/маршрут, который настроен для RelaxDev.
+BYBIT_API_BASE_URL=
+
+# Research
+RESEARCH_SYMBOLS=VVVUSDT,ENAUSDT
+RESEARCH_SNAPSHOT_INTERVAL_SEC=900
+RESEARCH_LOOKBACK_DAYS=14
+
+# Research failure alert
+RESEARCH_FAILURE_ALERT_AFTER=3
+
+# Optional: SQLite path
+MAGNET_RESEARCH_DB=magnet_research.sqlite3
