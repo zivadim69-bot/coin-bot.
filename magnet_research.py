@@ -22,7 +22,8 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from common import get_bybit_ohlcv, get_bybit_ticker, find_swing_points, build_level_zones, compute_magnet_score
+from common import (get_bybit_ohlcv, get_bybit_ticker, get_bybit_open_interest_history,
+                    find_swing_points, build_level_zones, compute_magnet_score)
 from cross_exchange import collect_cross_exchange, payload_json, compact_summary
 
 DB_PATH = os.environ.get("MAGNET_DB_PATH", "magnet_research.sqlite3")
@@ -30,7 +31,7 @@ RESEARCH_SYMBOLS = [x.strip().upper() for x in os.environ.get("MAGNET_RESEARCH_S
 RESEARCH_INTERVAL_SECONDS = int(os.environ.get("MAGNET_RESEARCH_INTERVAL_SECONDS", "900"))
 RESEARCH_LOOKBACK_DAYS = int(os.environ.get("MAGNET_RESEARCH_LOOKBACK_DAYS", "14"))
 
-TF_SPECS = {"15m": ("15", 300), "1H": ("60", 300), "4H": ("240", 300), "1D": ("D", 365)}
+TF_SPECS = {"5m": ("5", 100), "15m": ("15", 300), "1H": ("60", 300), "4H": ("240", 300), "1D": ("D", 365)}
 HORIZONS_MIN = (15, 30, 60, 240, 720, 1440)
 
 
@@ -550,54 +551,67 @@ def export_exchange_csv(path='magnet_research_results.csv', symbol=None):
 
 
 def get_oi_dynamics(symbol, current_cross, now_ms=None):
-    """Calculate OI change and acceleration from persisted 15m cross-exchange snapshots.
+    """Calculate live OI delta/acceleration from Bybit historical OI API.
 
-    Acceleration is defined as: ΔOI over the latest 15m minus the 30m ΔOI
-    normalized to a 15m rate. Positive means the short-term OI growth rate is
-    increasing; negative means it is slowing. Historical values are used only
-    for research/display and never modify scoring or filters.
+    /coin must work for a symbol even when the bot has never seen it before.
+    Therefore live OI dynamics are sourced directly from Bybit's historical
+    OI endpoint. SQLite snapshots remain research storage only and are not a
+    prerequisite for the live card.
+
+    Acceleration: latest 15m OI change minus half of the latest 30m change.
+    Positive means the short-term OI growth rate is increasing.
     """
     now_ms = int(now_ms or time.time() * 1000)
-    conn = _db()
-    rows = conn.execute(
-        "SELECT snapshot_ts,payload_json FROM cross_exchange_snapshots "
-        "WHERE symbol=? AND snapshot_ts<=? ORDER BY snapshot_ts DESC LIMIT 20",
-        (symbol, now_ms),
-    ).fetchall()
-    conn.close()
-
-    history = []
-    for row in rows:
-        try:
-            history.append((int(row['snapshot_ts']), json.loads(row['payload_json'])))
-        except Exception:
-            continue
-
-    def oi_at_or_before(target_ms, exchange):
-        for ts, payload in history:
-            if ts > target_ms:
-                continue
-            x = (payload.get('exchanges') or {}).get(exchange) or {}
-            if x.get('ok') and x.get('oi_usd') is not None:
-                return float(x['oi_usd']), ts
-        return None, None
-
     out = {}
-    for exchange, current in (current_cross.get('exchanges') or {}).items():
-        if not current.get('ok') or current.get('oi_usd') is None:
-            continue
-        oi_now = float(current['oi_usd'])
-        oi15, ts15 = oi_at_or_before(now_ms - 15 * 60 * 1000, exchange)
-        oi30, ts30 = oi_at_or_before(now_ms - 30 * 60 * 1000, exchange)
-        item = {'oi_usd': oi_now, 'delta_15m_pct': None, 'delta_30m_pct': None,
-                'accel_15m_pp': None, 'ts15': ts15, 'ts30': ts30}
-        if oi15 and oi15 > 0:
-            item['delta_15m_pct'] = (oi_now / oi15 - 1.0) * 100.0
-        if oi30 and oi30 > 0:
-            item['delta_30m_pct'] = (oi_now / oi30 - 1.0) * 100.0
-        if item['delta_15m_pct'] is not None and item['delta_30m_pct'] is not None:
-            item['accel_15m_pp'] = item['delta_15m_pct'] - item['delta_30m_pct'] / 2.0
-        out[exchange] = item
+    try:
+        history = get_bybit_open_interest_history(
+            symbol, interval="5min",
+            start=now_ms - 45 * 60 * 1000, end=now_ms, limit=20
+        )
+    except Exception as exc:
+        history = []
+        api_error = f"{type(exc).__name__}: {exc}"
+    else:
+        api_error = None
+
+    def at_or_before(target_ms):
+        eligible = [r for r in history if r["ts"] <= target_ms]
+        if not eligible:
+            return None, None
+        row = max(eligible, key=lambda r: r["ts"])
+        return float(row["open_interest"]), int(row["ts"])
+
+    current_bybit = (current_cross.get("exchanges") or {}).get("bybit") or {}
+    if current_bybit.get("ok") and current_bybit.get("oi_usd") is not None:
+        oi15, ts15 = at_or_before(now_ms - 15 * 60 * 1000)
+        oi30, ts30 = at_or_before(now_ms - 30 * 60 * 1000)
+        item = {
+            "oi_usd": float(current_bybit["oi_usd"]),
+            "delta_15m_pct": None,
+            "delta_30m_pct": None,
+            "accel_15m_pp": None,
+            "ts15": ts15, "ts30": ts30,
+            "source": "bybit_historical_api",
+            "reason": api_error or "no_bybit_historical_oi",
+        }
+        if oi15 is not None and oi15 > 0:
+            # Current OI is compared in the same base-unit domain as historical OI.
+            # Percentage change is therefore valid without a price conversion.
+            if history:
+                latest_hist = max(history, key=lambda r: r["ts"])
+                oi_now_hist = float(latest_hist["open_interest"])
+                item["delta_15m_pct"] = (oi_now_hist / oi15 - 1.0) * 100.0
+        if oi30 is not None and oi30 > 0:
+            if history:
+                latest_hist = max(history, key=lambda r: r["ts"])
+                oi_now_hist = float(latest_hist["open_interest"])
+                item["delta_30m_pct"] = (oi_now_hist / oi30 - 1.0) * 100.0
+        if item["delta_15m_pct"] is not None and item["delta_30m_pct"] is not None:
+            item["accel_15m_pp"] = item["delta_15m_pct"] - item["delta_30m_pct"] / 2.0
+            item["reason"] = None
+        elif api_error:
+            item["reason"] = "bybit_historical_api_error"
+        out["bybit"] = item
     return out
 
 
