@@ -230,6 +230,14 @@ def research_score(c):
     return compute_magnet_score(tests=c.get('tests',1), timeframe_count=len(set(x for x in str(c.get('timeframes','')).split(',') if x)), distance_pct=c.get('distance_pct',0), freshness_min=c.get('freshness_min'))
 
 
+def _normalize_timeframes(value):
+    # Candidates may carry MTF as a comma-separated string or as a list/tuple
+    # after merge_candidates(). Normalize both forms for presentation logic.
+    if isinstance(value, (list, tuple, set)):
+        return {str(x).strip() for x in value if str(x).strip()}
+    return {x.strip() for x in str(value or '').split(',') if x.strip()}
+
+
 def build_global_zones(candidates, current_price, cluster_gap_pct=3.0, max_zones=6):
     """Compress higher-timeframe levels into a few structural zones for /coin.
 
@@ -242,7 +250,7 @@ def build_global_zones(candidates, current_price, cluster_gap_pct=3.0, max_zones
     for c in candidates:
         if c.get('source') not in allowed_sources:
             continue
-        tfs={x for x in str(c.get('timeframes','')).split(',') if x}
+        tfs=_normalize_timeframes(c.get('timeframes',''))
         if not (tfs & {'1H','4H','1D'}):
             continue
         eligible.append(c)
@@ -259,7 +267,7 @@ def build_global_zones(candidates, current_price, cluster_gap_pct=3.0, max_zones
     zones=[]
     for items in groups:
         prices=[float(x['price']) for x in items]
-        tfs=sorted({tf for x in items for tf in str(x.get('timeframes','')).split(',') if tf})
+        tfs=sorted({tf for x in items for tf in _normalize_timeframes(x.get('timeframes',''))})
         sources=sorted({x.get('source') for x in items})
         zones.append({
             'low':min(prices),'high':max(prices),'price':_median(prices),

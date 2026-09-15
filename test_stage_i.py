@@ -272,6 +272,10 @@ def test_global_zones_compress_noise_without_research_score():
         {'price': 4.3812, 'source': 'liquidity_proxy', 'timeframes': '15m', 'tests': 4},
     ]
     zones = build_global_zones(candidates, price)
+    # Regression: merged candidates can carry MTF as a list, not only a string.
+    candidates_with_list_mtf = [dict(c, timeframes=[c['timeframes']]) for c in candidates]
+    zones_list_mtf = build_global_zones(candidates_with_list_mtf, price)
+    assert zones_list_mtf
     assert any(z['low'] <= 4.036 and z['high'] >= 4.1649 for z in zones)
     assert any(z['low'] <= 4.5924 and z['high'] >= 4.7284 for z in zones)
     assert any(z['low'] == 5.323 and z['high'] == 5.323 for z in zones)
