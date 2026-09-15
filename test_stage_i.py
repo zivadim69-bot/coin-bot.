@@ -257,3 +257,22 @@ def test_storage_backup_upload_uses_relaxdev_api(monkeypatch, tmp_path):
     monkeypatch.setattr(sb, 'cleanup_old_backups', lambda: 0)
     result = sb.upload_backup(str(db))
     assert result and result['success'] is True
+
+def test_global_zones_compress_noise_without_research_score():
+    from magnet_research import build_global_zones, format_current_report
+    price = 4.40
+    candidates = [
+        {'price': 4.036, 'source': 'swing', 'timeframes': '4H', 'tests': 2},
+        {'price': 4.0947, 'source': 'hvn', 'timeframes': '4H', 'tests': 1},
+        {'price': 4.1649, 'source': 'hvn', 'timeframes': '4H', 'tests': 1},
+        {'price': 4.5924, 'source': 'hvn', 'timeframes': '1H', 'tests': 1},
+        {'price': 4.6264, 'source': 'hvn', 'timeframes': '1H', 'tests': 1},
+        {'price': 4.7284, 'source': 'vpoc', 'timeframes': '1H', 'tests': 1},
+        {'price': 5.3230, 'source': 'swing', 'timeframes': '4H', 'tests': 2},
+        {'price': 4.3812, 'source': 'liquidity_proxy', 'timeframes': '15m', 'tests': 4},
+    ]
+    zones = build_global_zones(candidates, price)
+    assert any(z['low'] <= 4.036 and z['high'] >= 4.1649 for z in zones)
+    assert any(z['low'] <= 4.5924 and z['high'] >= 4.7284 for z in zones)
+    assert any(z['low'] == 5.323 and z['high'] == 5.323 for z in zones)
+    assert not any(z['low'] <= 4.3812 <= z['high'] for z in zones)

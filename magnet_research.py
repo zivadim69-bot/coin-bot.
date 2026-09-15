@@ -230,6 +230,52 @@ def research_score(c):
     return compute_magnet_score(tests=c.get('tests',1), timeframe_count=len(set(x for x in str(c.get('timeframes','')).split(',') if x)), distance_pct=c.get('distance_pct',0), freshness_min=c.get('freshness_min'))
 
 
+def build_global_zones(candidates, current_price, cluster_gap_pct=3.0, max_zones=6):
+    """Compress higher-timeframe levels into a few structural zones for /coin.
+
+    Presentation-only: raw candidates and research statistics are unchanged.
+    4H/1D structure is preferred; 1H volume structure is allowed. LVN and
+    15m-only liquidity proxy remain local context rather than global targets.
+    """
+    allowed_sources = {'swing', 'equal_hl', 'vpoc', 'hvn'}
+    eligible=[]
+    for c in candidates:
+        if c.get('source') not in allowed_sources:
+            continue
+        tfs={x for x in str(c.get('timeframes','')).split(',') if x}
+        if not (tfs & {'1H','4H','1D'}):
+            continue
+        eligible.append(c)
+    eligible.sort(key=lambda x:x['price'])
+    groups=[]
+    for c in eligible:
+        if not groups:
+            groups.append([c]); continue
+        center=_median([x['price'] for x in groups[-1]])
+        if abs(c['price']-center)/max(current_price,1e-12)*100 <= cluster_gap_pct:
+            groups[-1].append(c)
+        else:
+            groups.append([c])
+    zones=[]
+    for items in groups:
+        prices=[float(x['price']) for x in items]
+        tfs=sorted({tf for x in items for tf in str(x.get('timeframes','')).split(',') if tf})
+        sources=sorted({x.get('source') for x in items})
+        zones.append({
+            'low':min(prices),'high':max(prices),'price':_median(prices),
+            'side':'up' if _median(prices)>current_price else 'down',
+            'timeframes':tfs,'sources':sources,
+            'strength':3*len(tfs)+2*len(sources)+min(sum(int(x.get('tests',1) or 1) for x in items),6)
+        })
+    # Keep a balanced global map: up to half above and half below.
+    # This prevents nearby zones from crowding out important farther targets.
+    per_side=max(1,max_zones//2)
+    below=sorted((z for z in zones if z['side']=='down'), key=lambda z:(-z['strength'],abs(z['price']-current_price)))[:per_side]
+    above=sorted((z for z in zones if z['side']=='up'), key=lambda z:(-z['strength'],abs(z['price']-current_price)))[:per_side]
+    selected=below+above
+    return sorted(selected, key=lambda z:z['price'])
+
+
 def merge_candidates(candidates,current_price,tolerance_pct=.35):
     groups=[]
     for c in sorted(candidates,key=lambda x:x['price']):
@@ -627,12 +673,13 @@ def current_analysis(symbol):
     if not data.get('15m'): raise ValueError(f"Bybit linear {symbol} не найден или OHLCV недоступен")
     price=data['15m'][-1]['close']
     candidates=merge_candidates(build_research_candidates(data,price),price)
+    global_zones=build_global_zones(candidates,price)
     # Profile summary from 15m/1H.
     vp={tf:volume_profile(data.get(tf,[])) for tf in ('15m','1H','4H')}
     cross=collect_cross_exchange(symbol, price)
     oi_dynamics=get_oi_dynamics(symbol, cross)
     volume_dynamics=volume_pressure_dynamics(data)
-    return {'symbol':symbol,'price':price,'candles':data,'magnets':candidates,'vp':vp,'cross_exchange':cross,'oi_dynamics':oi_dynamics,'volume_dynamics':volume_dynamics}
+    return {'symbol':symbol,'price':price,'candles':data,'magnets':candidates,'global_zones':global_zones,'vp':vp,'cross_exchange':cross,'oi_dynamics':oi_dynamics,'volume_dynamics':volume_dynamics}
 
 
 def format_current_report(analysis):
@@ -675,33 +722,35 @@ def format_current_report(analysis):
         )
     lines.append("ℹ️ Pressure — OHLCV-прокси; фактический агрессорный buy/sell и текущую незакрытую свечу не видим.")
     lines.append("")
-    lines.append("🧲 МАГНИТЫ / ЗОНЫ")
-    for m in mags[:8]:
-        arrow='⬆️' if m['side']=='up' else '⬇️'
-        lines.append(f"{arrow} {_fmt_price(m['price'])} ({m['distance_pct']:+.2f}%) · research score {m['score']:.0f} · {','.join(m['sources'])} · MTF {','.join(m['timeframes']) or '-'}")
-    if not mags: lines.append("нет данных")
+    lines.append("🧭 ГЛОБАЛЬНЫЕ ЗОНЫ — без research score")
+    zones=analysis.get('global_zones') or []
+    for z in zones:
+        arrow='⬆️' if z['side']=='up' else '⬇️'
+        lo,hi=z['low'],z['high']
+        level=_fmt_price(z['price']) if abs(hi-lo)/p*100 < 0.08 else f"{_fmt_price(lo)}–{_fmt_price(hi)}"
+        d1=(lo-p)/p*100; d2=(hi-p)/p*100
+        dist=f"{d1:+.2f}%…{d2:+.2f}%" if abs(d1-d2)>1e-9 else f"{d1:+.2f}%"
+        lines.append(f"{arrow} {level} ({dist}) · {','.join(z['sources'])} · MTF {','.join(z['timeframes']) or '-'}")
+    if not zones: lines.append("нет данных")
+    local=[m for m in mags if abs(m['distance_pct']) <= 1.5]
+    if local:
+        lo=min(m['price'] for m in local); hi=max(m['price'] for m in local)
+        lines.append("")
+        lines.append(f"📍 ЛОКАЛЬНАЯ ЗОНА: {_fmt_price(lo)}–{_fmt_price(hi)} · {(lo-p)/p*100:+.2f}%…{(hi-p)/p*100:+.2f}%")
     cross=analysis.get('cross_exchange',{})
     lines.append("")
     lines.append("🌐 CROSS-EXCHANGE")
     lines.append(compact_summary(cross))
     lines.append("")
-    lines.append("📊 VOLUME PROFILE")
+    lines.append("📊 VOLUME PROFILE — глобальный контекст")
     def _level_text(level):
         d=(level-p)/p*100 if p else 0.0
         return f"{'⬆️' if level>p else '⬇️'} {_fmt_price(level)} ({d:+.2f}%)"
-    for tf in ('15m','1H','4H'):
+    for tf in ('1H','4H'):
         x=vp.get(tf,{})
         if x.get('vpoc'):
-            lines.append(f"{tf}: VPOC {_level_text(x['vpoc'])} · HVN {', '.join(_level_text(v) for v in x.get('hvn',[])[:3]) or '-'} · LVN {', '.join(_level_text(v) for v in x.get('lvn',[])[:3]) or '-'}")
-    eq=equal_high_low(c15)
-    if eq:
-        lines.append(""); lines.append("📐 EQUAL HIGH / LOW")
-        for e in eq[:6]: lines.append(f"{'⬆️' if e['price'] > p else '⬇️'} {_fmt_price(e['price'])} ({(e['price']-p)/p*100:+.2f}%) · {e['tests']} совпадения")
-    liq=liquidity_clusters(c15)
-    liq=[x for x in liq if abs(x['price']-p)/p*100<=5]
-    if liq:
-        lines.append(""); lines.append("💧 LIQUIDITY PROXY (OHLCV)")
-        for x in sorted(liq,key=lambda z:abs(z['price']-p))[:5]: lines.append(f"{'⬆️' if x['price']>p else '⬇️'} {_fmt_price(x['price'])} ({(x['price']-p)/p*100:+.2f}%) · density/volume cluster")
+            lines.append(f"{tf}: VPOC {_level_text(x['vpoc'])} · HVN {', '.join(_level_text(v) for v in x.get('hvn',[])[:3]) or '-'}")
+    lines.append("ℹ️ 15m EQH/EQL и liquidity proxy остаются в расчётах, но не выводятся отдельными целями.")
     lines.append(""); lines.append("⏱ MTF: 15m / 1H / 4H / 1D · данные Bybit")
     lines.append("ℹ️ Liquidity здесь — OHLCV-прокси, не стакан и не карта ликвидаций.")
     return '\n'.join(lines)
