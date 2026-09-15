@@ -687,7 +687,7 @@ def format_current_report(analysis):
     eq=equal_high_low(c15)
     if eq:
         lines.append(""); lines.append("📐 EQUAL HIGH / LOW")
-        for e in eq[:6]: lines.append(f"{'⬆️' if e['side']=='up' else '⬇️'} {_fmt_price(e['price'])} · {e['tests']} совпадения")
+        for e in eq[:6]: lines.append(f"{'⬆️' if e['price'] > p else '⬇️'} {_fmt_price(e['price'])} · {e['tests']} совпадения")
     liq=liquidity_clusters(c15)
     liq=[x for x in liq if abs(x['price']-p)/p*100<=5]
     if liq:

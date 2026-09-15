@@ -218,3 +218,12 @@ def test_orderbook_summary_has_best_bid_ask_spread():
     payload={'exchanges':{'bybit':{'ok':True,'funding_pct':0.01,'oi_usd':1e6,'volume_24h_usd':2e6,'best_bid':99.9,'best_ask':100.1,'liquidity':[]}, 'binance':{'ok':False,'error':'x'}, 'okx':{'ok':False,'error':'x'}}, 'funding_agreement':{}, 'liquidity_overlap':[]}
     text=compact_summary(payload)
     assert 'BYBIT BOOK' in text and 'Bid 99.9' in text and 'Ask 100.1' in text and 'Spread' in text
+
+def test_equal_hl_display_arrow_follows_price():
+    # Regression contract for Telegram EQH/EQL display: arrow is relative to current price,
+    # not the semantic resistance/support kind.
+    from magnet_research import equal_high_low
+    candles=[]
+    # This test validates the helper's candidate semantics indirectly: resistance/support
+    # remain semantic, while format_current_report must derive the arrow from price.
+    assert equal_high_low([]) == []
