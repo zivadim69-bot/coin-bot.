@@ -25,6 +25,7 @@ from pathlib import Path
 from common import (get_bybit_ohlcv, get_bybit_ticker, get_bybit_open_interest_history,
                     find_swing_points, build_level_zones, compute_magnet_score)
 from cross_exchange import collect_cross_exchange, payload_json, compact_summary
+from storage_backup import maybe_backup
 
 DB_PATH = os.environ.get("MAGNET_DB_PATH", "magnet_research.sqlite3")
 RESEARCH_SYMBOLS = [x.strip().upper() for x in os.environ.get("MAGNET_RESEARCH_SYMBOLS", "VVVUSDT,ENAUSDT").split(",") if x.strip()]
@@ -280,7 +281,7 @@ def historical_backfill(symbol, days=RESEARCH_LOOKBACK_DAYS, step_minutes=15):
         if i < 20: continue
         t0=c['ts'] + 15*60*1000
         # Only closed candles known at T0. Higher-TF candle must have ended by T0.
-        tf_ms={'15m':15*60*1000,'1H':60*60*1000,'4H':4*60*60*1000,'1D':24*60*60*1000}
+        tf_ms={'5m':5*60*1000,'15m':15*60*1000,'1H':60*60*1000,'4H':4*60*60*1000,'1D':24*60*60*1000}
         slices={}
         for tf,rows in hist.items():
             step=tf_ms[tf]
@@ -330,7 +331,7 @@ def snapshot_symbol(symbol, source='periodic'):
     closed15=data['15m'][-2] if len(data['15m'])>=2 else data['15m'][-1]
     price=closed15['close']
     # Build the snapshot only from closed candles to avoid partial-candle lookahead.
-    tf_ms={'15m':15*60*1000,'1H':60*60*1000,'4H':4*60*60*1000,'1D':24*60*60*1000}
+    tf_ms={'5m':5*60*1000,'15m':15*60*1000,'1H':60*60*1000,'4H':4*60*60*1000,'1D':24*60*60*1000}
     snapshot_ts=closed15['ts']+tf_ms['15m']
     closed_data={tf:[r for r in rows if r['ts']+tf_ms[tf]<=snapshot_ts] for tf,rows in data.items()}
     raw=build_research_candidates(closed_data,price)
@@ -349,6 +350,10 @@ def snapshot_symbol(symbol, source='periodic'):
         save_cross_exchange_snapshot(sid, symbol, snapshot_ts, price)
     except Exception as exc:
         print(f"[CrossExchange] {symbol}: {type(exc).__name__}: {exc}")
+    try:
+        maybe_backup(DB_PATH)
+    except Exception as exc:
+        print(f"[Storage] backup failed: {type(exc).__name__}: {exc}")
     return sid,len(raw)
 
 def evaluate_pending(symbol=None, max_rows=5000):

@@ -227,3 +227,33 @@ def test_equal_hl_display_arrow_follows_price():
     # This test validates the helper's candidate semantics indirectly: resistance/support
     # remain semantic, while format_current_report must derive the arrow from price.
     assert equal_high_low([]) == []
+
+def test_stage_i_snapshot_accepts_5m_history(monkeypatch, tmp_path):
+    import magnet_research
+    db = tmp_path / 'snapshot.sqlite3'
+    monkeypatch.setattr(magnet_research, 'DB_PATH', str(db))
+    monkeypatch.setattr(magnet_research, 'fetch_all', lambda symbol: {
+        '5m':[{'ts':1000,'close':10.0}],
+        '15m':[{'ts':1000,'close':10.0}],
+        '1H':[{'ts':0,'close':10.0}],
+        '4H':[{'ts':0,'close':10.0}],
+        '1D':[{'ts':0,'close':10.0}],
+    })
+    monkeypatch.setattr(magnet_research, 'build_research_candidates', lambda data, price: [])
+    monkeypatch.setattr(magnet_research, 'save_cross_exchange_snapshot', lambda *a, **k: None)
+    monkeypatch.setattr(magnet_research, 'maybe_backup', lambda *a, **k: None)
+    magnet_research.init_db()
+    result = magnet_research.snapshot_symbol('VVVUSDT')
+    assert result and result[1] == 0
+
+
+def test_storage_backup_upload_uses_relaxdev_api(monkeypatch, tmp_path):
+    import sqlite3
+    import storage_backup as sb
+    db = tmp_path / 'magnet_research.sqlite3'
+    conn = sqlite3.connect(db); conn.execute('CREATE TABLE t(x INTEGER)'); conn.execute('INSERT INTO t VALUES(7)'); conn.commit(); conn.close()
+    monkeypatch.setattr(sb, 'STORAGE_API_KEY', 'test-key')
+    monkeypatch.setattr(sb.requests, 'post', lambda *a, **kw: type('R', (), {'raise_for_status': lambda self: None, 'json': lambda self: {'success': True}})())
+    monkeypatch.setattr(sb, 'cleanup_old_backups', lambda: 0)
+    result = sb.upload_backup(str(db))
+    assert result and result['success'] is True
