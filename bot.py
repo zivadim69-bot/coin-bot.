@@ -13,6 +13,7 @@ from coin_dashboard_bot import (
     get_derivative_ticker, get_multi_timeframe_coingecko_extremes,
     format_message, send_telegram_message, get_dashboard_ticker,
 )
+from storage_backup import restore_latest, maybe_backup
 from magnet_research import (
     RESEARCH_SYMBOLS, RESEARCH_INTERVAL_SECONDS, ensure_research_history,
     init_db, snapshot_symbol, evaluate_pending,
@@ -34,9 +35,15 @@ def start_health_server(): HTTPServer(('0.0.0.0',PORT),HealthHandler).serve_fore
 RESEARCH_FAILURE_ALERT_AFTER = int(os.environ.get('RESEARCH_FAILURE_ALERT_AFTER','3'))
 
 def research_loop():
+    try:
+        restore_latest(os.environ.get("MAGNET_DB_PATH", "magnet_research.sqlite3"))
+    except Exception as exc:
+        print(f"[Storage] restore failed: {type(exc).__name__}: {exc}")
     init_db()
     try: ensure_research_history()
     except Exception as exc: print(f'[Research] startup: {type(exc).__name__}: {exc}')
+    try: maybe_backup(os.environ.get('MAGNET_DB_PATH', 'magnet_research.sqlite3'), force=True)
+    except Exception as exc: print(f'[Storage] startup backup failed: {type(exc).__name__}: {exc}')
     failures = {sym: 0 for sym in RESEARCH_SYMBOLS}
     alerted = {sym: False for sym in RESEARCH_SYMBOLS}
     while True:

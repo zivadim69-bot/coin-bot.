@@ -686,18 +686,22 @@ def format_current_report(analysis):
     lines.append(compact_summary(cross))
     lines.append("")
     lines.append("📊 VOLUME PROFILE")
+    def _level_text(level):
+        d=(level-p)/p*100 if p else 0.0
+        return f"{'⬆️' if level>p else '⬇️'} {_fmt_price(level)} ({d:+.2f}%)"
     for tf in ('15m','1H','4H'):
         x=vp.get(tf,{})
-        if x.get('vpoc'): lines.append(f"{tf}: VPOC {_fmt_price(x['vpoc'])} · HVN {', '.join(_fmt_price(v) for v in x.get('hvn',[])[:3]) or '-'} · LVN {', '.join(_fmt_price(v) for v in x.get('lvn',[])[:3]) or '-'}")
+        if x.get('vpoc'):
+            lines.append(f"{tf}: VPOC {_level_text(x['vpoc'])} · HVN {', '.join(_level_text(v) for v in x.get('hvn',[])[:3]) or '-'} · LVN {', '.join(_level_text(v) for v in x.get('lvn',[])[:3]) or '-'}")
     eq=equal_high_low(c15)
     if eq:
         lines.append(""); lines.append("📐 EQUAL HIGH / LOW")
-        for e in eq[:6]: lines.append(f"{'⬆️' if e['price'] > p else '⬇️'} {_fmt_price(e['price'])} · {e['tests']} совпадения")
+        for e in eq[:6]: lines.append(f"{'⬆️' if e['price'] > p else '⬇️'} {_fmt_price(e['price'])} ({(e['price']-p)/p*100:+.2f}%) · {e['tests']} совпадения")
     liq=liquidity_clusters(c15)
     liq=[x for x in liq if abs(x['price']-p)/p*100<=5]
     if liq:
         lines.append(""); lines.append("💧 LIQUIDITY PROXY (OHLCV)")
-        for x in sorted(liq,key=lambda z:abs(z['price']-p))[:5]: lines.append(f"{_fmt_price(x['price'])} · density/volume cluster")
+        for x in sorted(liq,key=lambda z:abs(z['price']-p))[:5]: lines.append(f"{'⬆️' if x['price']>p else '⬇️'} {_fmt_price(x['price'])} ({(x['price']-p)/p*100:+.2f}%) · density/volume cluster")
     lines.append(""); lines.append("⏱ MTF: 15m / 1H / 4H / 1D · данные Bybit")
     lines.append("ℹ️ Liquidity здесь — OHLCV-прокси, не стакан и не карта ликвидаций.")
     return '\n'.join(lines)
