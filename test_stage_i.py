@@ -15,6 +15,23 @@ def test_fixed_zone_anchor():
     zs=build_level_zones(pts,100,.35)
     assert max(z['high']-z['low'] for z in zs)<=.70+1e-9
 
+def test_irregular_zone_spacing_stays_within_merge_pct():
+    import random
+    current_price = 100.0
+    merge_pct = 0.35
+    rng = random.Random(20260915)
+    # Non-uniform spacing inside two fixed-width bands, with a clear gap between them.
+    offsets_pct = sorted(rng.uniform(-0.80 * merge_pct, -0.60 * merge_pct) for _ in range(20))
+    offsets_pct += sorted(rng.uniform(0.60 * merge_pct, 0.80 * merge_pct) for _ in range(20))
+    pts = [
+        {'price': current_price * (1 + off / 100.0),
+         'kind': 'resistance' if off >= 0 else 'support', 'ts': i}
+        for i, off in enumerate(offsets_pct)
+    ]
+    zones = build_level_zones(pts, current_price, merge_pct)
+    assert zones
+    assert all((z['high'] - z['low']) / current_price * 100 <= merge_pct + 1e-9 for z in zones)
+
 def test_shared_score():
     assert compute_magnet_score(3,2,.4,60)==research_score({'tests':3,'timeframes':'15m,1H','distance_pct':.4,'freshness_min':60})
 
@@ -42,6 +59,29 @@ def test_bybit_requires_explicit_route(monkeypatch):
         assert "BYBIT_API_BASE_URL" in str(exc)
 
 
+def test_resolver_strips_quote_suffix(monkeypatch):
+    import telegram_command_bot as tg
+    captured = {}
+    monkeypatch.setattr(tg, 'current_analysis', lambda q: (_ for _ in ()).throw(RuntimeError('forced')))
+    def fake_resolve(q):
+        captured['query'] = q
+        return {'candidates': [], 'resolved': None}
+    monkeypatch.setattr(tg, 'resolve_asset', fake_resolve)
+    result = tg.handle_coin('HYPEUSDT')
+    assert captured['query'] == 'HYPE'
+    assert 'Не удалось получить Bybit-анализ' in result
+
+
+def test_quote_suffix_helpers():
+    from common import strip_quote_suffix, ensure_usdt_suffix
+    assert strip_quote_suffix(' HYPEUSDT ') == 'HYPE'
+    assert strip_quote_suffix('HYPEUSDC') == 'HYPE'
+    assert strip_quote_suffix('HYPEUSD') == 'HYPE'
+    assert ensure_usdt_suffix('HYPE') == 'HYPEUSDT'
+    assert ensure_usdt_suffix('HYPEUSDC') == 'HYPEUSDT'
+    assert ensure_usdt_suffix('HYPEUSDT') == 'HYPEUSDT'
+
+
 def test_command_suffix():
     from telegram_command_bot import handle_command
     # Unknown command proves the parser strips @BotName before comparison;
@@ -62,29 +102,24 @@ def test_cross_exchange_helpers_are_independent():
     assert ov and set(ov[0]['exchanges']) == {'binance','bybit'}
 
 
-def test_oi_acceleration_from_persisted_snapshots():
-    import json, time
+def test_live_oi_dynamics_uses_bybit_history_not_sqlite(monkeypatch):
     import magnet_research
-    db=os.environ['MAGNET_DB_PATH']
-    init_db()
-    now=int(time.time()*1000)
-    conn=magnet_research._db()
-    conn.execute("INSERT INTO magnet_snapshots(symbol,snapshot_ts,current_price,source,created_at) VALUES(?,?,?,?,?)", ('VVVUSDT', now-30*60*1000, 100.0, 'test', now))
-    sid=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    for ts, oi in ((now-30*60*1000, 100_000_000), (now-15*60*1000, 104_000_000)):
-        payload={'exchanges':{'bybit':{'ok':True,'oi_usd':oi}}}
-        conn.execute(
-            "INSERT INTO cross_exchange_snapshots(snapshot_id,symbol,snapshot_ts,created_at,payload_json) VALUES(?,?,?,?,?)",
-            (sid,'VVVUSDT',ts,now,json.dumps(payload)),
-        )
-    conn.commit(); conn.close()
-    result=magnet_research.get_oi_dynamics(
-        'VVVUSDT', {'exchanges':{'bybit':{'ok':True,'oi_usd':108_000_000}}}, now_ms=now
+    now = 1_800_000_000_000
+    monkeypatch.setattr(magnet_research, 'get_bybit_open_interest_history', lambda *a, **kw: [
+        {'ts': now - 30*60*1000, 'open_interest': 100.0},
+        {'ts': now - 15*60*1000, 'open_interest': 104.0},
+        {'ts': now - 5*60*1000, 'open_interest': 108.0},
+    ])
+    result = magnet_research.get_oi_dynamics(
+        'NEVER_SEEN_USDT',
+        {'exchanges': {'bybit': {'ok': True, 'oi_usd': 999999.0}}},
+        now_ms=now,
     )
-    x=result['bybit']
-    assert round(x['delta_15m_pct'],2)==3.85
-    assert round(x['delta_30m_pct'],2)==8.0
-    assert round(x['accel_15m_pp'],2)==-0.15
+    x = result['bybit']
+    assert x['source'] == 'bybit_historical_api'
+    assert round(x['delta_15m_pct'], 2) == 3.85
+    assert round(x['delta_30m_pct'], 2) == 8.0
+    assert round(x['accel_15m_pp'], 2) == -0.15
 
 
 def test_volume_pressure_uses_closed_candles_and_recent_momentum():
@@ -161,3 +196,25 @@ def test_telegram_poll_reuses_offset(monkeypatch):
     monkeypatch.setattr(tg.requests, 'get', lambda *a, **kw: (calls.append(kw) or Resp()))
     tg.get_updates()
     assert calls[0]['params']['offset'] == 101
+
+def test_telegram_db_backup_zip(tmp_path, monkeypatch):
+    import sqlite3, zipfile
+    import telegram_command_bot as tg
+    db = tmp_path / 'magnet_research.sqlite3'
+    conn = sqlite3.connect(db); conn.execute('CREATE TABLE t(x INTEGER)'); conn.execute('INSERT INTO t VALUES(7)'); conn.commit(); conn.close()
+    monkeypatch.setattr(tg, 'DB_PATH', str(db))
+    monkeypatch.chdir(tmp_path)
+    result = tg.handle_command('/magnet_export_db')
+    assert isinstance(result, dict) and result['document'].endswith('.zip')
+    with zipfile.ZipFile(result['document']) as zf:
+        assert zf.namelist() == ['magnet_research.sqlite3']
+        data = zf.read('magnet_research.sqlite3')
+    restored = tmp_path / 'restored.sqlite3'; restored.write_bytes(data)
+    conn = sqlite3.connect(restored); assert conn.execute('SELECT x FROM t').fetchone()[0] == 7; conn.close()
+
+
+def test_orderbook_summary_has_best_bid_ask_spread():
+    from cross_exchange import compact_summary
+    payload={'exchanges':{'bybit':{'ok':True,'funding_pct':0.01,'oi_usd':1e6,'volume_24h_usd':2e6,'best_bid':99.9,'best_ask':100.1,'liquidity':[]}, 'binance':{'ok':False,'error':'x'}, 'okx':{'ok':False,'error':'x'}}, 'funding_agreement':{}, 'liquidity_overlap':[]}
+    text=compact_summary(payload)
+    assert 'BYBIT BOOK' in text and 'Bid 99.9' in text and 'Ask 100.1' in text and 'Spread' in text
