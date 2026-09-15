@@ -17,6 +17,21 @@ BYBIT_API_BASE = (os.environ.get("BYBIT_API_BASE_URL") or "").rstrip("/")
 
 _BYBIT_HEALTH = {"ok": None, "last_success_ms": None, "last_error": None, "last_error_ms": None}
 
+def strip_quote_suffix(symbol):
+    """Return ticker base without a trailing USDT/USDC/USD quote suffix."""
+    s = (symbol or "").strip().upper()
+    for suffix in ("USDT", "USDC", "USD"):
+        if s.endswith(suffix):
+            return s[:-len(suffix)]
+    return s
+
+
+def ensure_usdt_suffix(symbol):
+    """Normalize a ticker to its USDT form."""
+    base = strip_quote_suffix(symbol)
+    return f"{base}USDT" if base else None
+
+
 def bybit_configured():
     """True only when the Bybit route is explicitly configured."""
     return bool(BYBIT_API_BASE)
@@ -112,6 +127,38 @@ def get_bybit_ohlcv(symbol, interval, limit=500, category="linear", start=None, 
         "ts": int(x[0]), "open": float(x[1]), "high": float(x[2]), "low": float(x[3]),
         "close": float(x[4]), "volume": float(x[5]), "turnover": float(x[6])
     } for x in rows]
+
+
+def get_bybit_open_interest_history(symbol, interval="5min", start=None, end=None, limit=50, category="linear"):
+    """Historical Bybit open interest for live /coin analysis.
+
+    This reads Bybit's public historical OI endpoint directly, so a symbol does
+    not need to have been previously monitored by this bot. For linear USDT
+    contracts the returned OI is in base-coin units; percentage changes are
+    unit-invariant, so no price conversion is required for delta/acceleration.
+    """
+    params = {
+        "category": category,
+        "symbol": symbol.upper(),
+        "intervalTime": interval,
+        "limit": min(int(limit), 200),
+    }
+    if start is not None:
+        params["startTime"] = int(start)
+    if end is not None:
+        params["endTime"] = int(end)
+    result = _bybit_get("v5/market/open-interest", params)
+    rows = result.get("list", [])
+    out = []
+    for x in rows:
+        try:
+            out.append({
+                "ts": int(x["timestamp"]),
+                "open_interest": float(x["openInterest"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sorted(out, key=lambda x: x["ts"])
 
 
 def get_bybit_orderbook(symbol, category="linear", limit=100):
