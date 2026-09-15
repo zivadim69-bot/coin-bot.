@@ -20,6 +20,7 @@ OKX_BASE = (os.environ.get("OKX_API_BASE_URL") or "").rstrip("/")
 
 HTTP_TIMEOUT = 12
 BOOK_LIMIT = 50
+BOOK_DEPTH_LEVELS = 10
 
 
 def _http_get(base, path, params=None):
@@ -30,24 +31,53 @@ def _http_get(base, path, params=None):
     return r.json()
 
 
-def _okx_first(data, endpoint):
-    """Return the first OKX data item or raise a readable error instead of IndexError."""
-    rows = data.get("data") if isinstance(data, dict) else None
-    if not isinstance(rows, list) or not rows:
-        code = data.get("code") if isinstance(data, dict) else None
-        msg = data.get("msg") if isinstance(data, dict) else None
-        detail = f" code={code}" if code else ""
-        if msg:
-            detail += f" msg={msg}"
-        raise RuntimeError(f"OKX {endpoint}: пустой data{detail}")
-    return rows[0]
-
-
 def _symbol_base(symbol):
     s = symbol.upper().replace("-", "")
     if s.endswith("USDT"):
         return s[:-4]
     return s
+
+
+def _best_quote(rows):
+    """Return best price and displayed size from a live order-book side."""
+    if not rows or len(rows[0]) < 2:
+        return None, None
+    try:
+        price = float(rows[0][0])
+        qty = float(rows[0][1])
+    except (TypeError, ValueError):
+        return None, None
+    if price <= 0 or qty < 0:
+        return None, None
+    return price, qty
+
+
+def _book_depth(bids, asks, levels=BOOK_DEPTH_LEVELS):
+    """Current top-of-book depth only; no lifetime/persistence tracking."""
+    def side_depth(rows):
+        total = 0.0
+        count = 0
+        for row in rows[:levels]:
+            if len(row) < 2:
+                continue
+            try:
+                price = float(row[0]); qty = float(row[1])
+            except (TypeError, ValueError):
+                continue
+            if price > 0 and qty > 0:
+                total += price * qty
+                count += 1
+        return total, count
+    bid_usd, bid_levels = side_depth(bids)
+    ask_usd, ask_levels = side_depth(asks)
+    total = bid_usd + ask_usd
+    imbalance_pct = ((bid_usd - ask_usd) / total * 100.0) if total else 0.0
+    return {
+        "levels": levels,
+        "bid_usd": bid_usd, "ask_usd": ask_usd,
+        "bid_levels": bid_levels, "ask_levels": ask_levels,
+        "imbalance_pct": imbalance_pct,
+    }
 
 
 def _book_clusters(bids, asks, reference_price, max_clusters=3):
@@ -122,9 +152,12 @@ def _binance(symbol, reference_price):
     def book():
         d = _http_get(BINANCE_BASE, "/fapi/v1/depth", {"symbol": symbol, "limit": BOOK_LIMIT})
         bids, asks = d.get("bids", []), d.get("asks", [])
+        best_bid, best_bid_qty = _best_quote(bids)
+        best_ask, best_ask_qty = _best_quote(asks)
         return {"clusters": _book_clusters(bids, asks, reference_price),
-                "best_bid": float(bids[0][0]) if bids else None,
-                "best_ask": float(asks[0][0]) if asks else None}
+                "depth": _book_depth(bids, asks),
+                "best_bid": best_bid, "best_bid_qty": best_bid_qty,
+                "best_ask": best_ask, "best_ask_qty": best_ask_qty}
     with ThreadPoolExecutor(max_workers=4) as ex:
         fs = {"funding": ex.submit(funding), "oi": ex.submit(oi), "ticker": ex.submit(ticker), "book": ex.submit(book)}
         out = {}
@@ -134,7 +167,9 @@ def _binance(symbol, reference_price):
         "funding_pct": out["funding"], "oi_usd": out["oi"],
         "volume_24h_usd": out["ticker"]["volume_24h"],
         "price": out["ticker"]["price"], "liquidity": out["book"]["clusters"],
-        "best_bid": out["book"]["best_bid"], "best_ask": out["book"]["best_ask"], "ok": True,
+        "best_bid": out["book"]["best_bid"], "best_bid_qty": out["book"].get("best_bid_qty"),
+        "best_ask": out["book"]["best_ask"], "best_ask_qty": out["book"].get("best_ask_qty"),
+        "book_depth": out["book"]["depth"], "ok": True,
     }
     print(f'[CrossExchange] BINANCE OK {symbol} · OI=${result["oi_usd"]:,.0f} · Funding={result["funding_pct"]:+.4f}% · Vol=${result["volume_24h_usd"]:,.0f} · {time.time()-started:.2f}s', flush=True)
     return result
@@ -148,21 +183,24 @@ def _okx(symbol, reference_price):
     inst = f"{_symbol_base(symbol)}-USDT-SWAP"
     def funding():
         d = _http_get(OKX_BASE, "/api/v5/public/funding-rate", {"instId": inst})
-        return float(_okx_first(d, "funding-rate").get("fundingRate") or 0) * 100
+        return float(d["data"][0].get("fundingRate") or 0) * 100
     def oi():
         d = _http_get(OKX_BASE, "/api/v5/public/open-interest", {"instType": "SWAP", "instId": inst})
-        return float(_okx_first(d, "open-interest").get("oiUsd") or 0)
+        return float(d["data"][0].get("oiUsd") or 0)
     def ticker():
         d = _http_get(OKX_BASE, "/api/v5/market/ticker", {"instId": inst})
-        x = _okx_first(d, "ticker")
+        x = d["data"][0]
         return {"volume_24h": float(x.get("volCcy24h") or 0) * float(x.get("last") or 0), "price": float(x.get("last") or 0)}
     def book():
         d = _http_get(OKX_BASE, "/api/v5/market/books", {"instId": inst, "sz": BOOK_LIMIT})
-        x = _okx_first(d, "order-book")
+        x = d["data"][0]
         bids, asks = x.get("bids", []), x.get("asks", [])
+        best_bid, best_bid_qty = _best_quote(bids)
+        best_ask, best_ask_qty = _best_quote(asks)
         return {"clusters": _book_clusters(bids, asks, reference_price),
-                "best_bid": float(bids[0][0]) if bids else None,
-                "best_ask": float(asks[0][0]) if asks else None}
+                "depth": _book_depth(bids, asks),
+                "best_bid": best_bid, "best_bid_qty": best_bid_qty,
+                "best_ask": best_ask, "best_ask_qty": best_ask_qty}
     with ThreadPoolExecutor(max_workers=4) as ex:
         fs = {"funding": ex.submit(funding), "oi": ex.submit(oi), "ticker": ex.submit(ticker), "book": ex.submit(book)}
         out = {}
@@ -172,7 +210,9 @@ def _okx(symbol, reference_price):
         "funding_pct": out["funding"], "oi_usd": out["oi"],
         "volume_24h_usd": out["ticker"]["volume_24h"],
         "price": out["ticker"]["price"], "liquidity": out["book"]["clusters"],
-        "best_bid": out["book"]["best_bid"], "best_ask": out["book"]["best_ask"], "ok": True,
+        "best_bid": out["book"]["best_bid"], "best_bid_qty": out["book"].get("best_bid_qty"),
+        "best_ask": out["book"]["best_ask"], "best_ask_qty": out["book"].get("best_ask_qty"),
+        "book_depth": out["book"]["depth"], "ok": True,
     }
     print(f'[CrossExchange] OKX OK {symbol} · OI=${result["oi_usd"]:,.0f} · Funding={result["funding_pct"]:+.4f}% · Vol=${result["volume_24h_usd"]:,.0f} · {time.time()-started:.2f}s', flush=True)
     return result
@@ -190,8 +230,11 @@ def _bybit(symbol, reference_price):
         "funding_pct": t["funding_rate"], "oi_usd": t["open_interest_usd"],
         "volume_24h_usd": t["volume_24h"], "price": t["price"],
         "liquidity": _book_clusters(result.get("b", []), result.get("a", []), reference_price),
-        "best_bid": float(result.get("b", [[None]])[0][0]) if result.get("b") else None,
-        "best_ask": float(result.get("a", [[None]])[0][0]) if result.get("a") else None,
+        "best_bid": _best_quote(result.get("b", []))[0],
+        "best_bid_qty": _best_quote(result.get("b", []))[1],
+        "best_ask": _best_quote(result.get("a", []))[0],
+        "best_ask_qty": _best_quote(result.get("a", []))[1],
+        "book_depth": _book_depth(result.get("b", []), result.get("a", [])),
         "ok": True,
     }
 
@@ -225,6 +268,7 @@ def collect_cross_exchange(symbol, reference_price):
     return {
         "ts": int(time.time() * 1000),
         "symbol": symbol,
+        "reference_price": reference_price,
         "exchanges": results,
         "available": len(good),
         "funding_agreement": funding_ag,
@@ -266,24 +310,40 @@ def compact_summary(payload):
         if not x.get("ok"):
             lines.append(f"{label}: ❌ {x.get('error','unavailable')}")
             continue
-        funding = x.get("funding_pct")
-        oi_usd = x.get("oi_usd")
-        vol_usd = x.get("volume_24h_usd")
-        funding_text = f"{funding:+.4f}%" if funding is not None else "n/a"
-        oi_text = f"${oi_usd/1e6:.1f}M" if oi_usd is not None else "n/a"
-        vol_text = f"${vol_usd/1e6:.1f}M" if vol_usd is not None else "n/a"
-        lines.append(f"{label}: Funding {funding_text} · OI {oi_text} · Vol {vol_text}")
+        lines.append(f"{label}: Funding {x.get('funding_pct',0):+.4f}% · OI ${x.get('oi_usd',0)/1e6:.1f}M · Vol ${x.get('volume_24h_usd',0)/1e6:.1f}M")
         bid, ask = x.get("best_bid"), x.get("best_ask")
         if bid is not None and ask is not None and bid > 0:
             mid = (bid + ask) / 2.0
             spread_pct = (ask - bid) / mid * 100.0 if mid else 0.0
-            lines.append(f"{label} BOOK: Bid {bid:.8g} · Ask {ask:.8g} · Spread {spread_pct:.4f}%")
+            depth = x.get("book_depth") or {}
+            depth_text = ""
+            if depth:
+                depth_text = (f" · Depth{depth.get('levels', BOOK_DEPTH_LEVELS)} "
+                              f"B ${depth.get('bid_usd',0)/1e3:.0f}K / A ${depth.get('ask_usd',0)/1e3:.0f}K"
+                              f" · Imb {depth.get('imbalance_pct',0):+.1f}%")
+            bid_qty = x.get("best_bid_qty")
+            ask_qty = x.get("best_ask_qty")
+            size_text = ""
+            if bid_qty is not None or ask_qty is not None:
+                bqty = bid_qty or 0.0
+                aqty = ask_qty or 0.0
+                size_text = (f" · Size B {bqty:.6g} (${bid*bqty/1e3:.1f}K)"
+                             f" / A {aqty:.6g} (${ask*aqty/1e3:.1f}K)")
+            lines.append(f"{label} BOOK: Bid {bid:.8g} · Ask {ask:.8g} · Spread {spread_pct:.4f}%{size_text}{depth_text}")
+            walls = x.get("liquidity", [])[:3]
+            if walls:
+                wp=[]
+                ref = payload.get("reference_price") or x.get("price") or ((bid+ask)/2)
+                for w in walls:
+                    arrow = "⬆️" if w.get("side") == "ask" else "⬇️"
+                    wp.append(f"{arrow} {w['price']:.8g} ({(w['price']-ref)/ref*100:+.2f}%) ${w.get('notional_usd',0)/1e3:.0f}K")
+                lines.append(f"{label} walls: " + " · ".join(wp))
     fa=payload.get("funding_agreement",{})
     if fa.get("same_sign") is not None:
         lines.append(f"Funding agreement: {fa['same_sign']}/{fa['available']}")
     ov=payload.get("liquidity_overlap",[])
     if ov:
-        parts=[f"{x['side']} {x['price']:.6g} ({'/'.join(x['exchanges'])})" for x in ov[:3]]
+        parts=[f"{'⬆️' if x['side']=='ask' else '⬇️'} {x['price']:.6g} ({(x['price']-payload.get('reference_price', x['price']))/payload.get('reference_price', x['price'])*100:+.2f}%, {'/'.join(x['exchanges'])})" for x in ov[:3]]
         lines.append("Liquidity overlap: " + " · ".join(parts))
     else:
         lines.append("Liquidity overlap: нет совпадающих зон")
