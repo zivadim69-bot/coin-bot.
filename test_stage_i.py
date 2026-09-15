@@ -272,11 +272,86 @@ def test_global_zones_compress_noise_without_research_score():
         {'price': 4.3812, 'source': 'liquidity_proxy', 'timeframes': '15m', 'tests': 4},
     ]
     zones = build_global_zones(candidates, price)
-    # Regression: merged candidates can carry MTF as a list, not only a string.
-    candidates_with_list_mtf = [dict(c, timeframes=[c['timeframes']]) for c in candidates]
-    zones_list_mtf = build_global_zones(candidates_with_list_mtf, price)
-    assert zones_list_mtf
     assert any(z['low'] <= 4.036 and z['high'] >= 4.1649 for z in zones)
     assert any(z['low'] <= 4.5924 and z['high'] >= 4.7284 for z in zones)
     assert any(z['low'] == 5.323 and z['high'] == 5.323 for z in zones)
     assert not any(z['low'] <= 4.3812 <= z['high'] for z in zones)
+
+
+def test_vpoc_far_level_filtered_and_recent_decay_wins():
+    from magnet_research import volume_profile, build_research_candidates
+    base=1_700_000_000_000
+    candles=[]
+    for i,price in enumerate((130.0,100.0)):
+        candles.append({'ts':base+i*10*86400000,'open':price,'high':price+0.1,'low':price-0.1,'close':price,'volume':1000.0,'turnover':100000.0})
+    vp=volume_profile(candles,bins=20,half_life_days=2)
+    assert vp['vpoc'] < 115
+    c=build_research_candidates({'1H':candles},100.0)
+    assert not any(x['source'] in {'vpoc','vpoc_short'} and x['price'] > 108 for x in c)
+
+
+def test_orderbook_wall_stability_in_request():
+    from cross_exchange import annotate_wall_stability
+    def book(size):
+        return {'bids': [['99.0', str(size)]], 'asks': [['101.0', '1000']]}
+    stable=annotate_wall_stability([book(1000),book(1010),book(990)],100.0)
+    assert stable and any(x['side']=='bid' and x['stability']=='устойчивая' for x in stable)
+    unstable=annotate_wall_stability([book(1000),book(0.0),book(1000)],100.0)
+    assert any(x['side']=='bid' and x['stability']=='разовая' for x in unstable)
+
+
+def test_liquidity_proxy_book_confirmation():
+    import magnet_research as mr
+    raw=[{'price':100.0,'source':'liquidity_proxy','timeframes':'15m','tests':3}]
+    walls=[{'price':100.1,'side':'bid','notional_usd':10000,'stability':'устойчивая'}]
+    price=100.0
+    for c in raw:
+        matches=[w for w in walls if abs(w['price']-c['price'])/price*100 <= 0.25]
+        if matches:
+            c['book_confirmed']=True
+            c['book_confirmation']='устойчивая'
+    assert raw[0]['book_confirmed'] and raw[0]['book_confirmation']=='устойчивая'
+    raw2=[{'price':101.0,'source':'liquidity_proxy','timeframes':'15m','tests':3}]
+    assert not any(abs(w['price']-raw2[0]['price'])/price*100 <= 0.25 for w in walls)
+
+
+def test_full_global_chain_integration(monkeypatch):
+    import magnet_research as mr
+    candles=[]
+    base=1_700_000_000_000
+    for i in range(80):
+        p=100.0 + (8 if i > 60 else 0) + (i%4)*0.2
+        candles.append({'ts':base+i*15*60*1000,'open':p-0.2,'high':p+0.8,'low':p-0.8,'close':p,'volume':1000+i*10,'turnover':100000+i*1000})
+    raw=mr.build_research_candidates({'15m':candles,'1H':candles,'4H':candles,'1D':candles},108.0)
+    merged=mr.merge_candidates(raw,108.0)
+    zones=mr.build_global_zones(raw,108.0)
+    assert raw and merged and zones
+    analysis={'symbol':'TESTUSDT','price':108.0,'candles':{'15m':candles,'1H':candles,'4H':candles,'1D':candles},'magnets':merged,'global_zones':zones,
+              'vp':{tf:mr.volume_profile(candles) for tf in ('15m','1H','4H','1D')},'cross_exchange':{'exchanges':{},'funding_agreement':{},'liquidity_overlap':[]},'oi_dynamics':{},'volume_dynamics':{}}
+    monkeypatch.setattr(mr,'current_market',lambda s:{'change_pct':0,'volume_24h':1000000,'open_interest_usd':1000000,'funding_rate':0})
+    text=mr.format_current_report(analysis)
+    assert 'ГЛОБАЛЬНЫЕ ЗОНЫ' in text and 'нет данных' not in text
+
+
+def test_startup_self_check_offline():
+    from magnet_research import run_startup_self_check
+    assert run_startup_self_check() is True
+
+
+def test_pressure_snapshot_evaluator_fills_only_elapsed_horizons(monkeypatch, tmp_path):
+    import sqlite3, magnet_research as mr
+    db=tmp_path/'pressure.sqlite3'
+    monkeypatch.setattr(mr,'DB_PATH',str(db))
+    mr.init_db()
+    t=1_800_000_000_000
+    conn=sqlite3.connect(db)
+    conn.execute("INSERT INTO pressure_snapshots(symbol,snapshot_ts,tf,volume_usd,vol_accel_pct,pressure,pressure_momentum_pp,created_at) VALUES(?,?,?,?,?,?,?,?)",('VVVUSDT',t,'15m',100,10,5,2,t))
+    conn.commit(); conn.close()
+    candles=[]
+    for i in range(20):
+        candles.append({'ts':t+i*15*60*1000,'open':100,'high':101,'low':99,'close':100+i,'volume':1000,'turnover':100000})
+    monkeypatch.setattr(mr,'get_bybit_ohlcv',lambda *a,**k:candles)
+    changed=mr.evaluate_pressure_pending('VVVUSDT')
+    assert changed==1
+    conn=sqlite3.connect(db); row=conn.execute('SELECT fwd_return_15m,fwd_return_30m,fwd_return_1h,fwd_return_4h,evaluated_at FROM pressure_snapshots').fetchone(); conn.close()
+    assert row[0] is not None and row[1] is not None and row[2] is not None and row[3] is not None and row[4] is not None

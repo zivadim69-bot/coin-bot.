@@ -16,7 +16,7 @@ from coin_dashboard_bot import (
 from storage_backup import restore_latest, maybe_backup
 from magnet_research import (
     RESEARCH_SYMBOLS, RESEARCH_INTERVAL_SECONDS, ensure_research_history,
-    init_db, snapshot_symbol, evaluate_pending,
+    init_db, snapshot_symbol, evaluate_pending, evaluate_pressure_pending, run_startup_self_check,
 )
 from telegram_command_bot import run_poll_once
 from common import check_bybit_health, bybit_status
@@ -53,6 +53,7 @@ def research_loop():
                 result=snapshot_symbol(sym,source='periodic')
                 print(f'[Research] snapshot {sym}: {result}')
                 evaluate_pending(sym)
+                evaluate_pressure_pending(sym)
                 failures[sym] = 0
                 alerted[sym] = False
             except Exception as exc:
@@ -84,6 +85,15 @@ def run_dashboard_once():
 
 def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: raise SystemExit('TELEGRAM_TOKEN and TELEGRAM_CHAT_ID are required')
+    try:
+        run_startup_self_check()
+    except Exception as exc:
+        print(f'[SelfCheck][FATAL] {type(exc).__name__}: {exc}', flush=True)
+        try:
+            send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, f'🚨 Coin Bot self-check FAILED\n{type(exc).__name__}: {exc}')
+        except Exception as alert_exc:
+            print(f'[SelfCheck] Telegram alert failed: {type(alert_exc).__name__}: {alert_exc}', flush=True)
+        raise SystemExit(1)
     threading.Thread(target=start_health_server,daemon=True).start()
     threading.Thread(target=research_loop,daemon=True).start()
     threading.Thread(target=telegram_loop,daemon=True).start()

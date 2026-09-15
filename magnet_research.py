@@ -31,6 +31,8 @@ DB_PATH = os.environ.get("MAGNET_DB_PATH", "magnet_research.sqlite3")
 RESEARCH_SYMBOLS = [x.strip().upper() for x in os.environ.get("MAGNET_RESEARCH_SYMBOLS", "VVVUSDT,ENAUSDT").split(",") if x.strip()]
 RESEARCH_INTERVAL_SECONDS = int(os.environ.get("MAGNET_RESEARCH_INTERVAL_SECONDS", "900"))
 RESEARCH_LOOKBACK_DAYS = int(os.environ.get("MAGNET_RESEARCH_LOOKBACK_DAYS", "14"))
+VP_DECAY_HALF_LIFE_DAYS = float(os.environ.get("MAGNET_VP_DECAY_HALF_LIFE_DAYS", "7"))
+VP_SHORT_WINDOW_DAYS = int(os.environ.get("MAGNET_VP_SHORT_WINDOW_DAYS", "7"))
 
 TF_SPECS = {"5m": ("5", 100), "15m": ("15", 300), "1H": ("60", 300), "4H": ("240", 300), "1D": ("D", 365)}
 HORIZONS_MIN = (15, 30, 60, 240, 720, 1440)
@@ -88,6 +90,13 @@ def init_db():
       UNIQUE(symbol, snapshot_ts)
     );
     CREATE INDEX IF NOT EXISTS idx_ces_symbol_ts ON cross_exchange_snapshots(symbol, snapshot_ts);
+    CREATE TABLE IF NOT EXISTS pressure_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, snapshot_ts INTEGER NOT NULL,
+      tf TEXT NOT NULL, volume_usd REAL, vol_accel_pct REAL, pressure REAL, pressure_momentum_pp REAL,
+      created_at INTEGER NOT NULL, fwd_return_15m REAL, fwd_return_30m REAL, fwd_return_1h REAL,
+      fwd_return_4h REAL, evaluated_at INTEGER, UNIQUE(symbol,snapshot_ts,tf)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pressure_symbol_ts ON pressure_snapshots(symbol,snapshot_ts);
     """)
     conn.commit(); conn.close()
 
@@ -137,32 +146,41 @@ def equal_high_low(candles, tolerance_pct=0.12, min_occurrences=2):
     return out
 
 
-def volume_profile(candles, bins=48):
-    """Approximate volume profile by distributing candle volume across its range."""
+def volume_profile(candles, bins=48, half_life_days=None):
+    """Approximate volume profile with exponential age decay.
+
+    The newest candle has weight 1.0; a candle one half-life older has weight
+    0.5. Returned metadata makes the calculation window explicit.
+    """
     if not candles: return {}
+    candles = sorted(candles, key=lambda c: int(c['ts']))
     lo = min(c['low'] for c in candles); hi = max(c['high'] for c in candles)
     if hi <= lo: return {}
+    half_life_days = float(half_life_days if half_life_days is not None else VP_DECAY_HALF_LIFE_DAYS)
+    half_life_ms = max(1.0, half_life_days * 86400000.0)
+    newest_ts = int(candles[-1]['ts'])
     step = (hi-lo)/bins
     profile = [0.0]*bins
     for c in candles:
+        age_ms = max(0, newest_ts - int(c['ts']))
+        weight = math.exp(-math.log(2.0) * age_ms / half_life_ms)
         start = max(0, min(bins-1, int((c['low']-lo)/step)))
         end = max(0, min(bins-1, int((c['high']-lo)/step)))
         count = max(1, end-start+1)
-        share = c['volume']/count
+        share = float(c.get('volume') or 0.0) * weight / count
         for i in range(start, end+1): profile[i] += share
-    levels = []
-    for i,v in enumerate(profile):
-        levels.append((lo+(i+0.5)*step, v))
+    levels = [(lo+(i+0.5)*step, v) for i,v in enumerate(profile)]
     levels.sort(key=lambda x:x[1], reverse=True)
     vpoc = levels[0][0] if levels else None
     vals = [v for _,v in levels]
-    hvn = []
-    lvn = []
+    hvn=[]; lvn=[]
     if vals:
-        hvn_cut = _percentile(vals, 0.75); lvn_cut = _percentile(vals, 0.25)
-        hvn = [p for p,v in levels if v >= hvn_cut][:5]
-        lvn = [p for p,v in levels if v <= lvn_cut][:5]
-    return {'vpoc':vpoc, 'hvn':hvn, 'lvn':lvn, 'lo':lo, 'hi':hi}
+        hvn_cut=_percentile(vals,.75); lvn_cut=_percentile(vals,.25)
+        hvn=[p for p,v in levels if v >= hvn_cut][:5]
+        lvn=[p for p,v in levels if v <= lvn_cut][:5]
+    span_days = max(0.0, (newest_ts - int(candles[0]['ts'])) / 86400000.0)
+    return {'vpoc':vpoc,'hvn':hvn,'lvn':lvn,'lo':lo,'hi':hi,
+            'window_days':span_days,'half_life_days':half_life_days,'bars':len(candles)}
 
 
 def _percentile(values, q):
@@ -208,17 +226,23 @@ def build_research_candidates(candles_by_tf, current_price):
         candidates += equal_high_low(candles_by_tf.get(tf,[]))
         for c in candidates[-10:]:
             if c['source']=='equal_hl' and not c['timeframes']: c['timeframes']=tf
-    # VP and liquidity from 15m; 1H is also represented for MTF context.
-    for tf in ('15m','1H','4H'):
-        vp=volume_profile(candles_by_tf.get(tf,[]))
-        if vp.get('vpoc'):
-            candidates.append({'price':vp['vpoc'],'side':'up' if vp['vpoc']>current_price else 'down','source':'vpoc','tests':1,'timeframes':tf,'freshness_min':0})  # VPOC пересчитывается на snapshot; freshness=0 означает свежесть расчёта, не историческую давность реакции.
+    # Volume profile: full TF window with decay + a short, current window.
+    for tf in ('15m','1H','4H','1D'):
+        rows=candles_by_tf.get(tf,[])
+        vp=volume_profile(rows)
+        tf_minutes={'15m':15,'1H':60,'4H':240,'1D':1440}[tf]
+        short_bars=max(1, int((VP_SHORT_WINDOW_DAYS*1440)/tf_minutes))
+        vp_short=volume_profile(rows[-short_bars:], half_life_days=VP_DECAY_HALF_LIFE_DAYS) if rows else {}
+        if vp_short.get('vpoc') and abs(vp_short['vpoc']-current_price)/current_price*100 <= 8:
+            candidates.append({'price':vp_short['vpoc'],'side':'up' if vp_short['vpoc']>current_price else 'down','source':'vpoc_short','tests':1,'timeframes':tf,'freshness_min':0,'window_days':VP_SHORT_WINDOW_DAYS,'window_label':f'{tf} VPOC, {VP_SHORT_WINDOW_DAYS}д'})
+        if vp.get('vpoc') and abs(vp['vpoc']-current_price)/current_price*100 <= 8:
+            candidates.append({'price':vp['vpoc'],'side':'up' if vp['vpoc']>current_price else 'down','source':'vpoc','tests':1,'timeframes':tf,'freshness_min':0,'window_days':vp.get('window_days'),'window_label':f"{tf} VPOC, {vp.get('window_days',0):g}д"})
         for p in vp.get('hvn',[]):
             if abs(p-current_price)/current_price*100 <= 8:
-                candidates.append({'price':p,'side':'up' if p>current_price else 'down','source':'hvn','tests':1,'timeframes':tf,'freshness_min':0})  # HVN пересчитывается на snapshot; freshness=0 по построению.
+                candidates.append({'price':p,'side':'up' if p>current_price else 'down','source':'hvn','tests':1,'timeframes':tf,'freshness_min':0,'window_days':vp.get('window_days'),'window_label':f"{tf} HVN, {vp.get('window_days',0):g}д"})
         for p in vp.get('lvn',[]):
             if abs(p-current_price)/current_price*100 <= 8:
-                candidates.append({'price':p,'side':'up' if p>current_price else 'down','source':'lvn','tests':1,'timeframes':tf,'freshness_min':0})  # LVN пересчитывается на snapshot; freshness=0 по построению.
+                candidates.append({'price':p,'side':'up' if p>current_price else 'down','source':'lvn','tests':1,'timeframes':tf,'freshness_min':0,'window_days':vp.get('window_days'),'window_label':f"{tf} LVN, {vp.get('window_days',0):g}д"})
     for x in liquidity_clusters(candles_by_tf.get('15m',[])):
         if abs(x['price']-current_price)/current_price*100 <= 8:
             candidates.append({'price':x['price'],'side':'up' if x['price']>current_price else 'down','source':'liquidity_proxy','tests':x['tests'],'timeframes':'15m','freshness_min':0})  # Proxy пересчитывается на snapshot; freshness=0 по построению.
@@ -230,14 +254,6 @@ def research_score(c):
     return compute_magnet_score(tests=c.get('tests',1), timeframe_count=len(set(x for x in str(c.get('timeframes','')).split(',') if x)), distance_pct=c.get('distance_pct',0), freshness_min=c.get('freshness_min'))
 
 
-def _normalize_timeframes(value):
-    # Candidates may carry MTF as a comma-separated string or as a list/tuple
-    # after merge_candidates(). Normalize both forms for presentation logic.
-    if isinstance(value, (list, tuple, set)):
-        return {str(x).strip() for x in value if str(x).strip()}
-    return {x.strip() for x in str(value or '').split(',') if x.strip()}
-
-
 def build_global_zones(candidates, current_price, cluster_gap_pct=3.0, max_zones=6):
     """Compress higher-timeframe levels into a few structural zones for /coin.
 
@@ -245,12 +261,12 @@ def build_global_zones(candidates, current_price, cluster_gap_pct=3.0, max_zones
     4H/1D structure is preferred; 1H volume structure is allowed. LVN and
     15m-only liquidity proxy remain local context rather than global targets.
     """
-    allowed_sources = {'swing', 'equal_hl', 'vpoc', 'hvn'}
+    allowed_sources = {'swing', 'equal_hl', 'vpoc', 'vpoc_short', 'hvn'}
     eligible=[]
     for c in candidates:
         if c.get('source') not in allowed_sources:
             continue
-        tfs=_normalize_timeframes(c.get('timeframes',''))
+        tfs={x for x in str(c.get('timeframes','')).split(',') if x}
         if not (tfs & {'1H','4H','1D'}):
             continue
         eligible.append(c)
@@ -267,12 +283,14 @@ def build_global_zones(candidates, current_price, cluster_gap_pct=3.0, max_zones
     zones=[]
     for items in groups:
         prices=[float(x['price']) for x in items]
-        tfs=sorted({tf for x in items for tf in _normalize_timeframes(x.get('timeframes',''))})
+        tfs=sorted({tf for x in items for tf in str(x.get('timeframes','')).split(',') if tf})
         sources=sorted({x.get('source') for x in items})
         zones.append({
             'low':min(prices),'high':max(prices),'price':_median(prices),
             'side':'up' if _median(prices)>current_price else 'down',
             'timeframes':tfs,'sources':sources,
+            'windows_days':sorted({round(float(x.get('window_days')),1) for x in items if x.get('window_days') is not None}),
+            'volume_windows':sorted({x.get('window_label') for x in items if x.get('window_label')}),
             'strength':3*len(tfs)+2*len(sources)+min(sum(int(x.get('tests',1) or 1) for x in items),6)
         })
     # Keep a balanced global map: up to half above and half below.
@@ -309,7 +327,7 @@ def merge_candidates(candidates,current_price,tolerance_pct=.35):
 
 def get_bybit_history(symbol, interval, start_ms, end_ms):
     """Fetch a bounded historical range, paging backward because Bybit caps a response."""
-    step_ms = {"15":15*60*1000, "60":60*60*1000, "240":240*60*1000, "D":24*60*60*1000}.get(str(interval),15*60*1000)
+    step_ms = {"5":5*60*1000, "15":15*60*1000, "60":60*60*1000, "240":240*60*1000, "D":24*60*60*1000}.get(str(interval),15*60*1000)
     out=[]; cursor=int(end_ms)
     while cursor > start_ms:
         rows=get_bybit_ohlcv(symbol, interval, limit=1000, start=start_ms, end=cursor)
@@ -399,6 +417,14 @@ def snapshot_symbol(symbol, source='periodic'):
         score=research_score({**c,'distance_pct':d})
         cur.execute("INSERT INTO magnet_candidates(snapshot_id,symbol,magnet_price,side,source,score,distance_pct,tests,timeframes,freshness_min) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (sid,symbol,c['price'],c['side'],c['source'],score,d,c.get('tests',1),c.get('timeframes',''),c.get('freshness_min')))
+    # Pressure research is intentionally limited to RESEARCH_SYMBOLS and reuses fetched OHLCV.
+    if symbol.upper() in RESEARCH_SYMBOLS:
+        vd=volume_pressure_dynamics(closed_data, now_ms=snapshot_ts)
+        for tf in ('5m','10m','15m'):
+            x=vd.get(tf) or {}
+            if x.get('ok'):
+                cur.execute("INSERT OR REPLACE INTO pressure_snapshots(symbol,snapshot_ts,tf,volume_usd,vol_accel_pct,pressure,pressure_momentum_pp,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                            (symbol.upper(),snapshot_ts,tf,x.get('volume_usd'),x.get('volume_accel_pct'),x.get('pressure_pct'),x.get('pressure_momentum_pp'),int(time.time())))
     conn.commit(); conn.close()
     try:
         save_cross_exchange_snapshot(sid, symbol, snapshot_ts, price)
@@ -557,6 +583,41 @@ def volume_pressure_dynamics(candles_by_tf, now_ms=None, window=5, recent=2):
     return result
 
 
+def evaluate_pressure_pending(symbol=None, max_rows=5000):
+    """Evaluate forward returns for stored pressure snapshots using Bybit 15m OHLCV."""
+    conn=_db(); q="SELECT * FROM pressure_snapshots WHERE symbol IN ({})".format(','.join('?' for _ in RESEARCH_SYMBOLS)); params=list(RESEARCH_SYMBOLS)
+    if symbol and symbol.upper() in RESEARCH_SYMBOLS:
+        q="SELECT * FROM pressure_snapshots WHERE symbol=?"; params=[symbol.upper()]
+    q += " AND evaluated_at IS NULL ORDER BY snapshot_ts LIMIT ?"; params.append(max_rows)
+    rows=conn.execute(q,params).fetchall()
+    if not rows: conn.close(); return 0
+    changed=0
+    for sym in sorted({r['symbol'] for r in rows}):
+        rs=[r for r in rows if r['symbol']==sym]
+        future=get_bybit_ohlcv(sym,'15',limit=1000)
+        if not future: continue
+        by_ts={int(c['ts']):float(c['close']) for c in future}
+        for r in rs:
+            t=int(r['snapshot_ts']); base=None
+            eligible=[(ts,px) for ts,px in by_ts.items() if ts>=t]
+            if not eligible: continue
+            base=min(eligible,key=lambda x:x[0])[1]
+            vals={}; all_done=True
+            for minutes,col in ((15,'fwd_return_15m'),(30,'fwd_return_30m'),(60,'fwd_return_1h'),(240,'fwd_return_4h')):
+                target=t+minutes*60*1000
+                fut=[(ts,px) for ts,px in by_ts.items() if ts>=target]
+                if fut:
+                    px=min(fut,key=lambda x:x[0])[1]; vals[col]=(px/base-1)*100 if base else None
+                else:
+                    vals[col]=None; all_done=False
+            sets=','.join(f'{k}=?' for k in vals); args=list(vals.values())
+            if all_done:
+                sets+=', evaluated_at=?'; args.append(int(time.time()*1000))
+            args.append(r['id'])
+            conn.execute(f'UPDATE pressure_snapshots SET {sets} WHERE id=?',args); changed+=1
+    conn.commit(); conn.close(); return changed
+
+
 def _fmt_usd_volume(v):
     v = float(v or 0.0)
     if v >= 1_000_000_000:
@@ -680,11 +741,31 @@ def current_analysis(symbol):
     data=fetch_all(symbol)
     if not data.get('15m'): raise ValueError(f"Bybit linear {symbol} не найден или OHLCV недоступен")
     price=data['15m'][-1]['close']
-    candidates=merge_candidates(build_research_candidates(data,price),price)
-    global_zones=build_global_zones(candidates,price)
-    # Profile summary from 15m/1H.
-    vp={tf:volume_profile(data.get(tf,[])) for tf in ('15m','1H','4H')}
+    raw_candidates=build_research_candidates(data,price)
+    candidates=merge_candidates(raw_candidates,price)
+    global_zones=build_global_zones(raw_candidates,price)
+    if not global_zones:
+        eligible_count=sum(1 for c in raw_candidates if c.get('source') in {'swing','equal_hl','vpoc','vpoc_short','hvn'} and (set(str(c.get('timeframes','')).split(',')) & {'1H','4H','1D'}))
+        if eligible_count:
+            print(f'[GlobalZones][WARNING] {symbol}: eligible={eligible_count}, global_zones=0')
+    vp={tf:volume_profile(data.get(tf,[])) for tf in ('15m','1H','4H','1D')}
     cross=collect_cross_exchange(symbol, price)
+    # Mark OHLCV liquidity-proxy candidates that are confirmed by a live book wall.
+    walls=[w for x in (cross.get('exchanges') or {}).values() if x.get('ok') for w in (x.get('liquidity') or [])]
+    for c in raw_candidates:
+        if c.get('source') != 'liquidity_proxy':
+            continue
+        matches=[w for w in walls if abs(float(w.get('price',0))-float(c['price']))/price*100 <= 0.25]
+        if matches:
+            c['book_confirmed']=True
+            c['book_confirmation']='устойчивая' if any(w.get('stability')=='устойчивая' for w in matches) else 'разовая'
+    candidates=merge_candidates(raw_candidates,price)
+    for c in candidates:
+        if c.get('sources') and 'liquidity_proxy' in c['sources']:
+            proxy_matches=[x for x in raw_candidates if x.get('source')=='liquidity_proxy' and abs(x['price']-c['price'])/price*100<=0.35 and x.get('book_confirmed')]
+            if proxy_matches:
+                c['book_confirmed']=True
+                c['book_confirmation']='устойчивая' if any(x.get('book_confirmation')=='устойчивая' for x in proxy_matches) else 'разовая'
     oi_dynamics=get_oi_dynamics(symbol, cross)
     volume_dynamics=volume_pressure_dynamics(data)
     return {'symbol':symbol,'price':price,'candles':data,'magnets':candidates,'global_zones':global_zones,'vp':vp,'cross_exchange':cross,'oi_dynamics':oi_dynamics,'volume_dynamics':volume_dynamics}
@@ -738,13 +819,23 @@ def format_current_report(analysis):
         level=_fmt_price(z['price']) if abs(hi-lo)/p*100 < 0.08 else f"{_fmt_price(lo)}–{_fmt_price(hi)}"
         d1=(lo-p)/p*100; d2=(hi-p)/p*100
         dist=f"{d1:+.2f}%…{d2:+.2f}%" if abs(d1-d2)>1e-9 else f"{d1:+.2f}%"
-        lines.append(f"{arrow} {level} ({dist}) · {','.join(z['sources'])} · MTF {','.join(z['timeframes']) or '-'}")
+        win_labels=z.get('volume_windows') or []
+        win_text=(' · '+', '.join(win_labels)) if win_labels else ''
+        src_text=','.join(z['sources'])
+        lines.append(f"{arrow} {level} ({dist}) · {src_text} · MTF {','.join(z['timeframes']) or '-'}{win_text}")
     if not zones: lines.append("нет данных")
     local=[m for m in mags if abs(m['distance_pct']) <= 1.5]
     if local:
         lo=min(m['price'] for m in local); hi=max(m['price'] for m in local)
         lines.append("")
         lines.append(f"📍 ЛОКАЛЬНАЯ ЗОНА: {_fmt_price(lo)}–{_fmt_price(hi)} · {(lo-p)/p*100:+.2f}%…{(hi-p)/p*100:+.2f}%")
+    confirmed=[m for m in mags if m.get('book_confirmed') and 'liquidity_proxy' in (m.get('sources') or [])]
+    if confirmed:
+        parts=[]
+        for m in confirmed[:4]:
+            a='⬆️' if m['price']>p else '⬇️'; status=m.get('book_confirmation','подтверждено')
+            parts.append(f"{a} {_fmt_price(m['price'])} ({m['distance_pct']:+.2f}%) · подтверждено стаканом ({status})")
+        lines.append("💧 PROXY ↔ BOOK: " + ' · '.join(parts))
     cross=analysis.get('cross_exchange',{})
     lines.append("")
     lines.append("🌐 CROSS-EXCHANGE")
@@ -762,6 +853,38 @@ def format_current_report(analysis):
     lines.append(""); lines.append("⏱ MTF: 15m / 1H / 4H / 1D · данные Bybit")
     lines.append("ℹ️ Liquidity здесь — OHLCV-прокси, не стакан и не карта ликвидаций.")
     return '\n'.join(lines)
+
+
+def run_startup_self_check():
+    """Offline regression check for the raw->merge->global->report chain."""
+    base_ts=int(time.time()*1000)-20*15*60*1000
+    candles=[]
+    for i in range(40):
+        close=100.0 + (8.0 if i >= 30 else 0.0) + (i % 5) * 0.2
+        candles.append({'ts':base_ts+i*15*60*1000,'open':close-0.5,'high':close+1.0,'low':close-1.0,'close':close,'volume':1000.0 + i*10,'turnover':100000.0 + i*1000})
+    data={'15m':candles,'1H':candles,'4H':candles,'1D':candles,'5m':[]}
+    raw=build_research_candidates(data,108.0)
+    if not raw: raise AssertionError('self-check: no raw candidates')
+    merged=merge_candidates(raw,108.0)
+    zones=build_global_zones(raw,108.0)
+    if not merged: raise AssertionError('self-check: merge_candidates empty')
+    if not zones: raise AssertionError('self-check: build_global_zones empty')
+    if not any(x.get('source') in {'vpoc','vpoc_short','hvn','swing'} and set(str(x.get('timeframes','')).split(',')) & {'1H','4H','1D'} for x in raw):
+        raise AssertionError('self-check: no higher-TF source')
+    # Exercise the presentation layer without any network call.
+    old_market=current_market
+    try:
+        globals()['current_market']=lambda _symbol:{'change_pct':0.0,'volume_24h':1_000_000.0,'open_interest_usd':1_000_000.0,'funding_rate':0.0}
+        text=format_current_report({'symbol':'SELFUSDT','price':108.0,'candles':data,'magnets':merged,'global_zones':zones,
+                                    'vp':{tf:volume_profile(data.get(tf,[])) for tf in ('15m','1H','4H','1D')},
+                                    'cross_exchange':{'exchanges':{},'funding_agreement':{},'liquidity_overlap':[]},
+                                    'oi_dynamics':{},'volume_dynamics':{}})
+    finally:
+        globals()['current_market']=old_market
+    if 'ГЛОБАЛЬНЫЕ ЗОНЫ' not in text or 'нет данных' in text:
+        raise AssertionError('self-check: report lost global zones')
+    print(f'[SelfCheck] OK raw={len(raw)} merged={len(merged)} global={len(zones)}', flush=True)
+    return True
 
 
 def ensure_research_history():

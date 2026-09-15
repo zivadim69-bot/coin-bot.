@@ -21,6 +21,10 @@ OKX_BASE = (os.environ.get("OKX_API_BASE_URL") or "").rstrip("/")
 HTTP_TIMEOUT = 12
 BOOK_LIMIT = 50
 BOOK_DEPTH_LEVELS = 10
+BOOK_SAMPLE_COUNT = max(2, min(3, int(os.environ.get("BOOK_SAMPLE_COUNT", "3"))))
+BOOK_SAMPLE_INTERVAL_SECONDS = float(os.environ.get("BOOK_SAMPLE_INTERVAL_SECONDS", "4"))
+BOOK_WALL_TOLERANCE_PCT = float(os.environ.get("BOOK_WALL_TOLERANCE_PCT", "0.10"))
+BOOK_WALL_SIZE_TOLERANCE_PCT = float(os.environ.get("BOOK_WALL_SIZE_TOLERANCE_PCT", "30"))
 
 
 def _http_get(base, path, params=None):
@@ -79,6 +83,40 @@ def _book_depth(bids, asks, levels=BOOK_DEPTH_LEVELS):
         "imbalance_pct": imbalance_pct,
     }
 
+
+def annotate_wall_stability(samples, reference_price, tolerance_pct=BOOK_WALL_TOLERANCE_PCT, size_tolerance_pct=BOOK_WALL_SIZE_TOLERANCE_PCT):
+    """Annotate current walls using only in-request book samples."""
+    if not samples:
+        return []
+    current=samples[-1]
+    base=_book_clusters(current.get('bids',[]), current.get('asks',[]), reference_price)
+    for wall in base:
+        stable=True
+        for sample in samples:
+            clusters=_book_clusters(sample.get('bids',[]), sample.get('asks',[]), reference_price)
+            matches=[x for x in clusters if x.get('side')==wall.get('side') and abs(x['price']-wall['price'])/reference_price*100 <= tolerance_pct]
+            if not matches:
+                stable=False; break
+            best=min(matches,key=lambda x:abs(x['price']-wall['price']))
+            base_notional=float(wall.get('notional_usd') or 0)
+            cur_notional=float(best.get('notional_usd') or 0)
+            if base_notional <= 0 or abs(cur_notional/base_notional-1)*100 > size_tolerance_pct:
+                stable=False; break
+        wall['stability']='устойчивая' if stable else 'разовая'
+    return base
+
+def _sample_book(fetcher, reference_price):
+    samples=[]
+    started=time.time()
+    for i in range(BOOK_SAMPLE_COUNT):
+        samples.append(fetcher())
+        if i < BOOK_SAMPLE_COUNT-1:
+            time.sleep(max(0.0, BOOK_SAMPLE_INTERVAL_SECONDS))
+    elapsed=time.time()-started
+    print(f'[OrderBook] samples={BOOK_SAMPLE_COUNT} interval={BOOK_SAMPLE_INTERVAL_SECONDS:g}s elapsed={elapsed:.2f}s', flush=True)
+    last=samples[-1]
+    return {**last, 'samples':samples, 'sample_elapsed_s':elapsed,
+            'clusters':annotate_wall_stability(samples, reference_price)}
 
 def _book_clusters(bids, asks, reference_price, max_clusters=3):
     """Turn current order-book levels into compact near-price liquidity clusters."""
@@ -150,14 +188,14 @@ def _binance(symbol, reference_price):
         d = _http_get(BINANCE_BASE, "/fapi/v1/ticker/24hr", {"symbol": symbol})
         return {"volume_24h": float(d.get("quoteVolume") or 0), "price": float(d.get("lastPrice") or 0)}
     def book():
-        d = _http_get(BINANCE_BASE, "/fapi/v1/depth", {"symbol": symbol, "limit": BOOK_LIMIT})
-        bids, asks = d.get("bids", []), d.get("asks", [])
-        best_bid, best_bid_qty = _best_quote(bids)
-        best_ask, best_ask_qty = _best_quote(asks)
-        return {"clusters": _book_clusters(bids, asks, reference_price),
-                "depth": _book_depth(bids, asks),
-                "best_bid": best_bid, "best_bid_qty": best_bid_qty,
-                "best_ask": best_ask, "best_ask_qty": best_ask_qty}
+        def fetch():
+            d = _http_get(BINANCE_BASE, "/fapi/v1/depth", {"symbol": symbol, "limit": BOOK_LIMIT})
+            return {"bids":d.get("bids", []), "asks":d.get("asks", [])}
+        sampled=_sample_book(fetch, reference_price)
+        bids, asks = sampled["bids"], sampled["asks"]
+        best_bid, best_bid_qty = _best_quote(bids); best_ask, best_ask_qty = _best_quote(asks)
+        sampled.update({"depth":_book_depth(bids,asks), "best_bid":best_bid, "best_bid_qty":best_bid_qty, "best_ask":best_ask, "best_ask_qty":best_ask_qty})
+        return sampled
     with ThreadPoolExecutor(max_workers=4) as ex:
         fs = {"funding": ex.submit(funding), "oi": ex.submit(oi), "ticker": ex.submit(ticker), "book": ex.submit(book)}
         out = {}
@@ -169,7 +207,7 @@ def _binance(symbol, reference_price):
         "price": out["ticker"]["price"], "liquidity": out["book"]["clusters"],
         "best_bid": out["book"]["best_bid"], "best_bid_qty": out["book"].get("best_bid_qty"),
         "best_ask": out["book"]["best_ask"], "best_ask_qty": out["book"].get("best_ask_qty"),
-        "book_depth": out["book"]["depth"], "ok": True,
+        "book_depth": out["book"]["depth"], "book_sample_elapsed_s": out["book"].get("sample_elapsed_s",0), "ok": True,
     }
     print(f'[CrossExchange] BINANCE OK {symbol} · OI=${result["oi_usd"]:,.0f} · Funding={result["funding_pct"]:+.4f}% · Vol=${result["volume_24h_usd"]:,.0f} · {time.time()-started:.2f}s', flush=True)
     return result
@@ -192,15 +230,15 @@ def _okx(symbol, reference_price):
         x = d["data"][0]
         return {"volume_24h": float(x.get("volCcy24h") or 0) * float(x.get("last") or 0), "price": float(x.get("last") or 0)}
     def book():
-        d = _http_get(OKX_BASE, "/api/v5/market/books", {"instId": inst, "sz": BOOK_LIMIT})
-        x = d["data"][0]
-        bids, asks = x.get("bids", []), x.get("asks", [])
-        best_bid, best_bid_qty = _best_quote(bids)
-        best_ask, best_ask_qty = _best_quote(asks)
-        return {"clusters": _book_clusters(bids, asks, reference_price),
-                "depth": _book_depth(bids, asks),
-                "best_bid": best_bid, "best_bid_qty": best_bid_qty,
-                "best_ask": best_ask, "best_ask_qty": best_ask_qty}
+        def fetch():
+            d = _http_get(OKX_BASE, "/api/v5/market/books", {"instId": inst, "sz": BOOK_LIMIT})
+            x = d["data"][0]
+            return {"bids":x.get("bids", []), "asks":x.get("asks", [])}
+        sampled=_sample_book(fetch, reference_price)
+        bids, asks = sampled["bids"], sampled["asks"]
+        best_bid, best_bid_qty = _best_quote(bids); best_ask, best_ask_qty = _best_quote(asks)
+        sampled.update({"depth":_book_depth(bids,asks), "best_bid":best_bid, "best_bid_qty":best_bid_qty, "best_ask":best_ask, "best_ask_qty":best_ask_qty})
+        return sampled
     with ThreadPoolExecutor(max_workers=4) as ex:
         fs = {"funding": ex.submit(funding), "oi": ex.submit(oi), "ticker": ex.submit(ticker), "book": ex.submit(book)}
         out = {}
@@ -212,7 +250,7 @@ def _okx(symbol, reference_price):
         "price": out["ticker"]["price"], "liquidity": out["book"]["clusters"],
         "best_bid": out["book"]["best_bid"], "best_bid_qty": out["book"].get("best_bid_qty"),
         "best_ask": out["book"]["best_ask"], "best_ask_qty": out["book"].get("best_ask_qty"),
-        "book_depth": out["book"]["depth"], "ok": True,
+        "book_depth": out["book"]["depth"], "book_sample_elapsed_s": out["book"].get("sample_elapsed_s",0), "ok": True,
     }
     print(f'[CrossExchange] OKX OK {symbol} · OI=${result["oi_usd"]:,.0f} · Funding={result["funding_pct"]:+.4f}% · Vol=${result["volume_24h_usd"]:,.0f} · {time.time()-started:.2f}s', flush=True)
     return result
@@ -223,19 +261,18 @@ def _bybit(symbol, reference_price):
         raise RuntimeError("BYBIT_API_BASE_URL не настроен")
     t = get_bybit_ticker(symbol)
     # Order book is public; use the same explicitly configured Bybit route.
-    d = _http_get(BYBIT_API_BASE, "/v5/market/orderbook", {"category": "linear", "symbol": symbol, "limit": BOOK_LIMIT})
-    result = d.get("result", {})
+    def fetch():
+        d = _http_get(BYBIT_API_BASE, "/v5/market/orderbook", {"category": "linear", "symbol": symbol, "limit": BOOK_LIMIT})
+        result=d.get("result", {})
+        return {"bids":result.get("b", []), "asks":result.get("a", [])}
+    sampled=_sample_book(fetch, reference_price)
+    bids,asks=sampled["bids"],sampled["asks"]
     return {
-        "exchange": "bybit", "symbol": symbol,
-        "funding_pct": t["funding_rate"], "oi_usd": t["open_interest_usd"],
-        "volume_24h_usd": t["volume_24h"], "price": t["price"],
-        "liquidity": _book_clusters(result.get("b", []), result.get("a", []), reference_price),
-        "best_bid": _best_quote(result.get("b", []))[0],
-        "best_bid_qty": _best_quote(result.get("b", []))[1],
-        "best_ask": _best_quote(result.get("a", []))[0],
-        "best_ask_qty": _best_quote(result.get("a", []))[1],
-        "book_depth": _book_depth(result.get("b", []), result.get("a", [])),
-        "ok": True,
+        "exchange":"bybit", "symbol":symbol, "funding_pct":t["funding_rate"], "oi_usd":t["open_interest_usd"],
+        "volume_24h_usd":t["volume_24h"], "price":t["price"], "liquidity":sampled["clusters"],
+        "best_bid":_best_quote(bids)[0], "best_bid_qty":_best_quote(bids)[1],
+        "best_ask":_best_quote(asks)[0], "best_ask_qty":_best_quote(asks)[1],
+        "book_depth":_book_depth(bids,asks), "book_sample_elapsed_s":sampled["sample_elapsed_s"], "ok":True,
     }
 
 
@@ -336,7 +373,7 @@ def compact_summary(payload):
                 ref = payload.get("reference_price") or x.get("price") or ((bid+ask)/2)
                 for w in walls:
                     arrow = "⬆️" if w.get("side") == "ask" else "⬇️"
-                    wp.append(f"{arrow} {w['price']:.8g} ({(w['price']-ref)/ref*100:+.2f}%) ${w.get('notional_usd',0)/1e3:.0f}K")
+                    wp.append(f"{arrow} {w['price']:.8g} ({(w['price']-ref)/ref*100:+.2f}%) ${w.get('notional_usd',0)/1e3:.0f}K · {w.get('stability','разовая')}")
                 lines.append(f"{label} walls: " + " · ".join(wp))
     fa=payload.get("funding_agreement",{})
     if fa.get("same_sign") is not None:
